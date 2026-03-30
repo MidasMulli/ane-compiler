@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+*.hwx
+*.npz
+/templates/*.hwx
+/templates/*.npz
+.DS_Store

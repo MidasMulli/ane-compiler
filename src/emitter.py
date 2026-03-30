@@ -1,0 +1,955 @@
+#!/usr/bin/env python3
+"""
+ane-compiler: Emit ANE .hwx binaries from model definitions.
+
+This module emits BEEFFACE Zin binaries (.hwx) that the Apple Neural Engine
+executes directly. It uses template-based emission: reference .hwx binaries
+(compiled by Apple's ANE compiler) provide the structural template, and the
+emitter fills in weights, activations, and graph-specific configuration.
+
+Architecture:
+    Model definition (graph + weights)
+        ↓
+    Graph partitioner (split into ANE-compatible subgraphs)
+        ↓
+    Template selector (pick .hwx template for each subgraph)
+        ↓
+    Weight packer (FP16 layout into __KERN_0)
+        ↓
+    Activation encoder (48K instruction stream or 64K PWL table)
+        ↓
+    HWX writer (assemble final binary)
+
+Supported operations:
+    - Linear (1x1 conv): any channel count, identity or custom weights
+    - ReLU, abs, tanh, sigmoid (48K activation class)
+    - SiLU, GELU, custom PWL (64K activation class)
+    - Fused linear → activation → linear (single .hwx, graph fusion)
+
+Requirements:
+    - Template .hwx files (from Apple ANE compiler output)
+    - ane-dispatch (for runtime loading and execution)
+
+Copyright 2026 Nick Lo. MIT License.
+"""
+
+import os
+import sys
+import struct
+import numpy as np
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple, Union
+from enum import Enum
+
+
+# ═══════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════
+
+BEEFFACE = 0xBEEFFACE
+ANE_CPU_TYPE = 128
+H17G_SUBTYPE = 9
+
+# Multi-pass markers
+PASS_BOUNDARY = 0x00FFF800      # Marks start of new pipeline pass in __text
+PASS_BOUNDARY_ALT = 0x00FFF860  # Alternate boundary (seen in pass 4 of layernorm)
+PASS_BOUNDARY_ALT2 = 0x00FFF868 # First-pass header variant
+OUTPUT_DMA = 0x83119640         # Output writeback opcode
+PROGRAM_TERM1 = 0x22001440      # Program terminator word 1
+PROGRAM_TERM2 = 0x01040021      # Program terminator word 2
+
+# File regions for template-based emission
+class Region(Enum):
+    HEADER = "header"           # 0x0000-0x001F (32 bytes, fixed)
+    LOAD_CMDS = "load_cmds"     # 0x0020-0x2F2F (variable)
+    SYMTAB = "symtab"           # after load_cmds (tile descriptor copy)
+    TEXT = "text"               # 0x4000+ (__text kernel program)
+    CONST = "const"             # after __text (__const pipeline config)
+    KERN0 = "kern0"             # 0xC000+ (weights + PWL + tile replication)
+    METADATA = "metadata"       # compiler info (non-functional)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Activation encoding
+# ═══════════════════════════════════════════════════════════════
+
+class ActivationType(Enum):
+    """Supported activation functions."""
+    RELU = "relu"
+    ABS = "abs"
+    TANH = "tanh"
+    SIGMOID = "sigmoid"
+    SILU = "silu"
+    GELU = "gelu"
+    GELU_TANH = "gelu_tanh"
+    LINEAR = "linear"
+    CUSTOM_PWL = "custom_pwl"
+
+
+@dataclass
+class PWLTable:
+    """Piecewise linear lookup table for 64K activation class.
+
+    Format: 84 bytes = 42 FP16 values
+        [0-3]: header (left_bound, right_bound_or_inf, center_x, center_y_or_inf)
+        [4-36]: 33 breakpoint y-values
+        [37-41]: footer (residuals, asymptotic_slope, metadata)
+    """
+    header: np.ndarray      # 4 FP16 values
+    breakpoints: np.ndarray  # 33 FP16 values
+    footer: np.ndarray       # 5 FP16 values
+
+    def to_bytes(self) -> bytes:
+        """Pack to 84-byte binary representation."""
+        return (self.header.astype(np.float16).tobytes() +
+                self.breakpoints.astype(np.float16).tobytes() +
+                self.footer.astype(np.float16).tobytes())
+
+    @classmethod
+    def from_bytes(cls, data: bytes) -> 'PWLTable':
+        """Parse from 84-byte binary."""
+        values = np.frombuffer(data[:84], dtype=np.float16)
+        return cls(
+            header=values[0:4].copy(),
+            breakpoints=values[4:37].copy(),
+            footer=values[37:42].copy()
+        )
+
+    @classmethod
+    def extract_from_hwx(cls, hwx_path: str) -> 'PWLTable':
+        """Extract PWL table from a 64K .hwx file at offset 0xC000."""
+        data = Path(hwx_path).read_bytes()
+        return cls.from_bytes(data[0xC000:0xC054])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Multi-pass __text parsing
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class PipelinePass:
+    """A single ANE pipeline pass within a multi-pass __text program.
+
+    Each pass is a contiguous block of instruction words that configures one
+    traversal through the ANE's 17-stage fixed-function pipeline. Passes are
+    delimited by PASS_BOUNDARY (0x00FFF800) markers.
+
+    The first pass has no boundary marker (it starts at __text offset 0).
+    Subsequent passes start with a 4-word header: [pass_info, 0, 0, 0]
+    followed by the boundary marker.
+    """
+    index: int                  # 0-based pass index
+    words: List[int]            # Raw instruction words
+    opcode: int = 0             # Primary opcode (0x????8005 pattern)
+    word_offset: int = 0        # Word offset within __text
+    has_conv_header: bool = False  # Has 0xFFC01540 conv pipeline header
+    pwl_ref_offset: int = -1    # Offset into __KERN_0 for PWL data (-1 = none)
+
+    def to_bytes(self) -> bytes:
+        return struct.pack(f'<{len(self.words)}I', *self.words)
+
+    @property
+    def byte_size(self) -> int:
+        return len(self.words) * 4
+
+
+def parse_multipass_text(text_data: bytes) -> List[PipelinePass]:
+    """Parse a multi-pass __text program into individual passes.
+
+    Each pass (except pass 0) starts with a 4-word header where
+    word[0] = 0x00XX000Y (Y = 1-based pass index in low nibble),
+    word[1] = 0. The header is followed by a boundary marker
+    (0x00FFF800 or variant like 0x00FFD800, 0x00FFF860).
+
+    Returns list of PipelinePass objects.
+    """
+    nwords = len(text_data) // 4
+    words = list(struct.unpack(f'<{nwords}I', text_data))
+
+    # Find pass header positions by looking for the 0x00XX000Y pattern
+    # where Y = pass index (1+) and following word is 0
+    pass_starts = []
+    for i in range(len(words) - 1):
+        w = words[i]
+        # Pattern: 0x00XX00YY where XX > 0, YY = pass index 1-15
+        idx = w & 0xFF
+        if (idx >= 1 and idx <= 15 and
+            (w >> 24) == 0 and
+            (w >> 16) & 0xFF > 0 and
+            (w >> 8) & 0xFF == 0 and
+            words[i + 1] == 0 and
+            i + 4 < len(words)):
+            # Verify: word at i+4 looks like a boundary marker (0x00FF????)
+            boundary = words[i + 4]
+            if (boundary & 0xFFFF0000) == 0x00FF0000:
+                pass_starts.append((i, idx))
+
+    if not pass_starts:
+        # Single-pass program
+        opcode = _find_opcode(words)
+        return [PipelinePass(index=0, words=words, opcode=opcode, word_offset=0)]
+
+    passes = []
+
+    # First pass: from word 0 to the first pass header
+    first_end = pass_starts[0][0]
+    first_words = words[:first_end]
+    passes.append(PipelinePass(
+        index=0, words=first_words, opcode=_find_opcode(first_words),
+        word_offset=0))
+
+    # Subsequent passes: from each header to the next header (or end)
+    for pi, (start, idx) in enumerate(pass_starts):
+        end = pass_starts[pi + 1][0] if pi + 1 < len(pass_starts) else nwords
+        pass_words = words[start:end]
+        opcode = _find_opcode(pass_words)
+        has_conv = 0xFFC01540 in pass_words
+        passes.append(PipelinePass(
+            index=idx, words=pass_words, opcode=opcode,
+            word_offset=start, has_conv_header=has_conv))
+
+    return passes
+
+
+def _find_opcode(words: List[int]) -> int:
+    """Find the primary opcode in an instruction word sequence.
+    ANE opcodes share the 0x8005 suffix in the low 16 bits."""
+    for w in words:
+        if w & 0xFFFF == 0x8005:
+            return w
+    return 0
+
+
+def assemble_multipass_text(passes: List[PipelinePass]) -> bytes:
+    """Reassemble individual passes into a complete __text program."""
+    result = bytearray()
+    for p in passes:
+        result.extend(p.to_bytes())
+    return bytes(result)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Softmax / LayerNorm emission parameters
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class SoftmaxParams:
+    """Parameters for softmax emission.
+
+    Softmax decomposes into 5 ANE passes:
+      1. reduce_max(x)
+      2. exp(x - max)   [PWL: exp table]
+      3. reduce_sum(exp)
+      4. reciprocal(sum) [PWL: reciprocal table]
+      5. exp * reciprocal
+
+    The two PWL tables (128 bytes each) live in __KERN_0.
+    """
+    exp_pwl: Optional[bytes] = None         # 128-byte exp PWL (None = use template)
+    reciprocal_pwl: Optional[bytes] = None  # 128-byte reciprocal PWL (None = use template)
+    dim: int = 64                           # Channel dimension
+
+    def get_kern0(self, template_kern0: bytes) -> bytes:
+        """Build __KERN_0 with optional PWL overrides."""
+        buf = bytearray(template_kern0)
+        if self.exp_pwl:
+            buf[0:128] = self.exp_pwl
+        if self.reciprocal_pwl:
+            buf[128:256] = self.reciprocal_pwl
+        return bytes(buf)
+
+
+@dataclass
+class LayerNormParams:
+    """Parameters for layernorm emission.
+
+    LayerNorm decomposes into 4 ANE passes:
+      1. mean(x)         [reduce + scale by 1/dim]
+      2. variance(x-mean) [abs opcode repurposed]
+      3. normalize        [(x-mean)/sqrt(var+eps)]
+      4. scale + shift    [gamma * normalized + beta, + output DMA]
+
+    Constants (epsilon, 1/dim) are embedded as FP32 literals in the instruction stream.
+    No __KERN_0 needed — gamma/beta are identity transforms in the template.
+    """
+    epsilon: float = 1e-5       # LayerNorm epsilon
+    dim: int = 64               # Channel dimension (affects 1/dim constant)
+
+    @property
+    def inv_dim_fp32_bytes(self) -> bytes:
+        """1/dim as FP32 bytes (for pass 1 reduction scale)."""
+        return struct.pack('<f', 1.0 / self.dim)
+
+    @property
+    def epsilon_fp32_bytes(self) -> bytes:
+        """Epsilon as FP32 bytes (embedded in pass 3)."""
+        return struct.pack('<f', self.epsilon)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Template registry
+# ═══════════════════════════════════════════════════════════════
+
+@dataclass
+class HWXTemplate:
+    """A reference .hwx binary that serves as a structural template.
+
+    Templates provide the fixed structure (headers, load commands, pipeline config).
+    The emitter replaces variable regions (weights, activations, tile descriptors).
+    """
+    name: str
+    path: str
+    data: bytes
+    template_class: str  # "48k_activation", "64k_activation", "conv", "conv_fused"
+
+    # Parsed regions
+    text_offset: int = 0
+    text_size: int = 0
+    const_offset: int = 0
+    const_size: int = 0
+    kern0_offset: int = 0
+    kern0_size: int = 0
+    symtab_offset: int = 0
+    symtab_size: int = 0
+    ncmds: int = 0
+    file_size: int = 0
+
+    # Activation data extracted from this template
+    text_data: bytes = b''
+    pwl_data: bytes = b''
+
+    # Multi-pass data (parsed lazily)
+    _passes: Optional[List[PipelinePass]] = field(default=None, repr=False)
+
+    @property
+    def passes(self) -> List[PipelinePass]:
+        """Parse __text into pipeline passes (cached)."""
+        if self._passes is None:
+            self._passes = parse_multipass_text(self.text_data)
+        return self._passes
+
+    @property
+    def num_passes(self) -> int:
+        return len(self.passes)
+
+    @classmethod
+    def load(cls, path: str, name: str = "", template_class: str = "auto") -> 'HWXTemplate':
+        """Load a .hwx file as a template."""
+        data = Path(path).read_bytes()
+        t = cls(name=name or Path(path).stem, path=path, data=data,
+                template_class=template_class)
+        t.file_size = len(data)
+        t._parse()
+        return t
+
+    def _parse(self):
+        """Parse the template's structure."""
+        magic = struct.unpack_from('<I', self.data, 0)[0]
+        if magic != BEEFFACE:
+            raise ValueError(f"Not a BEEFFACE binary: 0x{magic:08X}")
+
+        self.ncmds = struct.unpack_from('<I', self.data, 0x10)[0]
+
+        offset = 32
+        for _ in range(self.ncmds):
+            cmd = struct.unpack_from('<I', self.data, offset)[0]
+            cmdsize = struct.unpack_from('<I', self.data, offset + 4)[0]
+
+            if cmd == 0x19:  # LC_SEGMENT_64
+                segname = self.data[offset+8:offset+24].split(b'\x00')[0].decode('ascii')
+                nsects = struct.unpack_from('<I', self.data, offset+56+8)[0]
+
+                for s in range(nsects):
+                    s_off = offset + 72 + s * 80
+                    sectname = self.data[s_off:s_off+16].split(b'\x00')[0].decode('ascii')
+                    size = struct.unpack_from('<Q', self.data, s_off + 40)[0]
+                    foff = struct.unpack_from('<I', self.data, s_off + 48)[0]
+
+                    if segname == '__TEXT' and sectname == '__text':
+                        self.text_offset = foff
+                        self.text_size = size
+                    elif segname == '__TEXT' and sectname == '__const':
+                        self.const_offset = foff
+                        self.const_size = size
+                    elif segname == '__KERN_0' and sectname == '__kern_0':
+                        self.kern0_offset = foff
+                        self.kern0_size = size
+
+            elif cmd == 0x02:  # LC_SYMTAB
+                self.symtab_offset = struct.unpack_from('<I', self.data, offset + 8)[0]
+                nsyms = struct.unpack_from('<I', self.data, offset + 12)[0]
+                stroff = struct.unpack_from('<I', self.data, offset + 16)[0]
+                strsize = struct.unpack_from('<I', self.data, offset + 20)[0]
+                self.symtab_size = (stroff + strsize) - self.symtab_offset
+
+            offset += cmdsize
+
+        # Extract activation data
+        self.text_data = self.data[self.text_offset:self.text_offset + self.text_size]
+        if self.file_size > 0xC000:
+            self.pwl_data = self.data[0xC000:0xC054]
+
+        # Auto-detect template class
+        if self.template_class == "auto":
+            if self.kern0_offset > 0 and self.kern0_size == 256 and self.text_size > 800:
+                # 5-pass softmax: 256B PWL (exp+reciprocal), >800B __text
+                self.template_class = "softmax"
+            elif self.kern0_offset > 0:
+                if self.text_size > 400:
+                    self.template_class = "conv_fused"
+                else:
+                    self.template_class = "conv"
+            elif self.text_size > 400 and self.file_size == 49152:
+                # 4-pass layernorm: large __text, no __KERN_0, 48K file
+                self.template_class = "layernorm"
+            elif self.file_size == 65536:
+                self.template_class = "64k_activation"
+            else:
+                self.template_class = "48k_activation"
+
+
+class TemplateRegistry:
+    """Registry of available .hwx templates.
+
+    Templates are loaded from a directory of compiler-generated .hwx files.
+    Each template provides the structural skeleton for emitting a specific
+    type of ANE operation.
+    """
+
+    def __init__(self):
+        self.templates: Dict[str, HWXTemplate] = {}
+        self._activation_48k: Dict[str, HWXTemplate] = {}
+        self._activation_64k: Dict[str, HWXTemplate] = {}
+        self._conv: Dict[str, HWXTemplate] = {}
+        self._softmax: Dict[str, HWXTemplate] = {}
+        self._layernorm: Dict[str, HWXTemplate] = {}
+
+    def load_directory(self, path: str):
+        """Load all .hwx files from a directory as templates."""
+        p = Path(path)
+        for hwx in sorted(p.glob('*.hwx')):
+            try:
+                t = HWXTemplate.load(str(hwx))
+                self.templates[t.name] = t
+                self._categorize(t)
+            except Exception:
+                pass  # Skip unparseable files
+
+    def load_file(self, path: str, name: str = "", template_class: str = "auto"):
+        """Load a single .hwx file as a template."""
+        t = HWXTemplate.load(path, name=name, template_class=template_class)
+        self.templates[t.name] = t
+        self._categorize(t)
+
+    def _categorize(self, t: HWXTemplate):
+        if t.template_class == '48k_activation':
+            self._activation_48k[t.name] = t
+        elif t.template_class == '64k_activation':
+            self._activation_64k[t.name] = t
+        elif t.template_class in ('conv', 'conv_fused'):
+            self._conv[t.name] = t
+        elif t.template_class == 'softmax':
+            self._softmax[t.name] = t
+        elif t.template_class == 'layernorm':
+            self._layernorm[t.name] = t
+
+    def get_activation_template(self, activation: ActivationType) -> HWXTemplate:
+        """Get the best template for an activation function."""
+        name_map = {
+            ActivationType.RELU: 'relu',
+            ActivationType.ABS: 'abs',
+            ActivationType.SIGMOID: 'sigmoid',
+            ActivationType.SILU: 'silu_native_65536',
+            ActivationType.GELU: 'gelu_exact',
+            ActivationType.GELU_TANH: 'gelu_tanh',
+        }
+        target = name_map.get(activation)
+
+        # Try exact match
+        if target and target in self.templates:
+            return self.templates[target]
+
+        # Fallback: any template of the right class
+        if activation in (ActivationType.SILU, ActivationType.GELU,
+                         ActivationType.GELU_TANH, ActivationType.CUSTOM_PWL):
+            if self._activation_64k:
+                return next(iter(self._activation_64k.values()))
+
+        if self._activation_48k:
+            return next(iter(self._activation_48k.values()))
+
+        raise ValueError(f"No template available for {activation}")
+
+    def get_conv_template(self, with_pwl: bool = False) -> HWXTemplate:
+        """Get a conv template (fused conv+activation).
+        If with_pwl=True, prefer a template with PWL activation (SiLU/sigmoid)."""
+        if self._conv:
+            if with_pwl:
+                for name in ('conv_silu_mil_65536', 'conv_sigmoid_mil_65536'):
+                    if name in self._conv:
+                        return self._conv[name]
+            if 'conv_relu_mil_65536' in self._conv:
+                return self._conv['conv_relu_mil_65536']
+            return next(iter(self._conv.values()))
+        raise ValueError("No conv template available")
+
+    def get_softmax_template(self) -> HWXTemplate:
+        """Get a softmax template (5-pass multi-pass)."""
+        if self._softmax:
+            return next(iter(self._softmax.values()))
+        raise ValueError("No softmax template available. "
+                        "Load a softmax .hwx (e.g. from attention_probe_v3/)")
+
+    def get_layernorm_template(self) -> HWXTemplate:
+        """Get a layernorm template (4-pass multi-pass)."""
+        if self._layernorm:
+            return next(iter(self._layernorm.values()))
+        raise ValueError("No layernorm template available. "
+                        "Load a layernorm .hwx (e.g. from attention_probe_v3/)")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Weight packer
+# ═══════════════════════════════════════════════════════════════
+
+class WeightPacker:
+    """Pack model weights into ANE __KERN_0 tile-replicated format.
+
+    ANE __KERN_0 is organized as 16 tiles (one per ANE core).
+    Each tile is identical except for per-tile metadata bytes.
+
+    Tile layouts (determined from compiler output analysis):
+      - conv_only/relu: 512B/tile. Weights at offset 0. No PWL.
+      - conv_silu/gelu: 640B/tile. PWL (84B) at offset 0, weights at offset 128.
+      - conv_sigmoid:   640B/tile. PWL (84B) at offset 0, weights at offset 128.
+
+    Tile metadata diffs (bytes 1, 11, 21, 31 + one per-tile-index byte)
+    are preserved from the template — we only overwrite weight/PWL regions.
+    """
+    NUM_TILES = 16
+
+    @staticmethod
+    def pack_into_template(template_kern0: bytes, weights: np.ndarray,
+                           pwl: Optional['PWLTable'] = None) -> bytes:
+        """Pack weights (and optional PWL) into a template __KERN_0.
+
+        Preserves all tile metadata from the template. Only overwrites
+        the weight and PWL data regions within each tile.
+
+        Args:
+            template_kern0: original __KERN_0 bytes from a template .hwx
+            weights: [out_channels, in_channels] weight matrix
+            pwl: optional PWL table (for SiLU/GELU/sigmoid activations)
+
+        Returns:
+            New __KERN_0 bytes with weights and PWL replaced
+        """
+        kern0_size = len(template_kern0)
+        tile_size = kern0_size // WeightPacker.NUM_TILES
+        buf = bytearray(template_kern0)
+
+        w = weights.astype(np.float16).flatten()
+        w_bytes = w.tobytes()
+
+        # Determine weight offset within tile
+        if pwl is not None:
+            # PWL activations: PWL at 0-83, weights at 128+
+            weight_offset = 128
+            pwl_bytes = pwl.to_bytes()
+        else:
+            # No PWL: weights at offset 0
+            weight_offset = 0
+
+        for t in range(WeightPacker.NUM_TILES):
+            tile_start = t * tile_size
+
+            # Write weights
+            w_start = tile_start + weight_offset
+            w_end = w_start + len(w_bytes)
+            if w_end <= len(buf):
+                buf[w_start:w_end] = w_bytes
+
+            # Write PWL if provided
+            if pwl is not None:
+                pwl_start = tile_start
+                pwl_end = pwl_start + len(pwl_bytes)
+                if pwl_end <= len(buf):
+                    buf[pwl_start:pwl_end] = pwl_bytes
+
+        return bytes(buf)
+
+    @staticmethod
+    def pack_conv1x1_weights(weights: np.ndarray, kern0_size: int = 8192) -> bytes:
+        """Simple weight pack (no template). Creates zero-padded tiles."""
+        tile_size = kern0_size // WeightPacker.NUM_TILES
+        buf = bytearray(kern0_size)
+        w = weights.astype(np.float16).flatten()
+        w_bytes = w.tobytes()
+        for t in range(WeightPacker.NUM_TILES):
+            off = t * tile_size
+            buf[off:off + len(w_bytes)] = w_bytes
+        return bytes(buf)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HWX Writer
+# ═══════════════════════════════════════════════════════════════
+
+class HWXWriter:
+    """Assemble a complete .hwx binary from template + modifications.
+
+    The writer starts from a template binary and replaces specific regions:
+    - __text: kernel program (activation encoding)
+    - __kern_0: weights + PWL
+    - symtab: tile descriptor copy
+    - Header bytes: kernel count references
+
+    The template provides everything else: Mach-O header, segment layout,
+    LC_THREAD descriptors, compiler metadata, pipeline config.
+    """
+
+    def __init__(self, template: HWXTemplate):
+        self.template = template
+        self.output = bytearray(template.data)
+
+    def set_text(self, text_data: bytes):
+        """Replace __text kernel program."""
+        if len(text_data) != self.template.text_size:
+            raise ValueError(
+                f"__text size mismatch: template={self.template.text_size}, "
+                f"new={len(text_data)}. Use a template with matching __text size.")
+        self.output[self.template.text_offset:
+                    self.template.text_offset + len(text_data)] = text_data
+
+    def set_kern0(self, kern0_data: bytes):
+        """Replace __kern_0 weights/PWL data."""
+        off = self.template.kern0_offset
+        self.output[off:off + len(kern0_data)] = kern0_data
+
+    def set_tile_replication(self, data: bytes):
+        """Replace the full 0xC000-to-EOF region (weights + PWL + tile copies)."""
+        self.output[0xC000:0xC000 + len(data)] = data
+
+    def set_pwl_table(self, pwl: PWLTable):
+        """Replace only the 84-byte PWL table at 0xC000."""
+        pwl_bytes = pwl.to_bytes()
+        self.output[0xC000:0xC000 + len(pwl_bytes)] = pwl_bytes
+
+    def set_symtab_tiles(self, symtab_data: bytes):
+        """Replace symtab region (contains tile descriptor copy)."""
+        off = self.template.symtab_offset
+        self.output[off:off + len(symtab_data)] = symtab_data
+
+    def patch_fp32_at(self, word_index: int, value: float):
+        """Patch a FP32 constant in __text at the given word index.
+        Used for layernorm epsilon and 1/dim constants."""
+        off = self.template.text_offset + word_index * 4
+        struct.pack_into('<f', self.output, off, value)
+
+    def patch_kern0_region(self, offset: int, data: bytes):
+        """Patch a region within __KERN_0."""
+        abs_off = self.template.kern0_offset + offset
+        self.output[abs_off:abs_off + len(data)] = data
+
+    def build(self) -> bytes:
+        """Return the assembled .hwx binary."""
+        return bytes(self.output)
+
+    def write(self, path: str):
+        """Write the assembled .hwx to a file."""
+        Path(path).write_bytes(self.build())
+
+
+# ═══════════════════════════════════════════════════════════════
+# High-level emitter
+# ═══════════════════════════════════════════════════════════════
+
+class ANECompiler:
+    """High-level compiler: model definition → .hwx binary.
+
+    Usage:
+        compiler = ANECompiler('/path/to/templates/')
+
+        # Emit a simple activation
+        hwx = compiler.emit_activation(ActivationType.SILU)
+
+        # Emit a conv + activation (FFN layer)
+        hwx = compiler.emit_conv_activation(
+            weights=np.random.randn(8, 8).astype(np.float16),
+            activation=ActivationType.SILU
+        )
+
+        # Emit with custom PWL activation
+        pwl = PWLTable.extract_from_hwx('reference_silu.hwx')
+        hwx = compiler.emit_conv_activation(weights=w, activation_pwl=pwl)
+    """
+
+    def __init__(self, template_dir: str):
+        self.registry = TemplateRegistry()
+        self.registry.load_directory(template_dir)
+
+    def emit_activation(self, activation: ActivationType,
+                        output_path: Optional[str] = None) -> bytes:
+        """Emit a standalone activation .hwx (no weights)."""
+        template = self.registry.get_activation_template(activation)
+        writer = HWXWriter(template)
+
+        # For 64K class with different PWL: swap the table
+        if (activation == ActivationType.CUSTOM_PWL and
+            template.template_class == '64k_activation'):
+            raise ValueError("Custom PWL requires a PWLTable argument. "
+                           "Use emit_activation_pwl() instead.")
+
+        result = writer.build()
+        if output_path:
+            writer.write(output_path)
+        return result
+
+    def emit_activation_pwl(self, pwl: PWLTable,
+                            output_path: Optional[str] = None) -> bytes:
+        """Emit a 64K activation with custom PWL table."""
+        # Use any 64K template — the __text is shared
+        template = self.registry.get_activation_template(ActivationType.SILU)
+        writer = HWXWriter(template)
+        writer.set_pwl_table(pwl)
+
+        result = writer.build()
+        if output_path:
+            writer.write(output_path)
+        return result
+
+    def emit_conv_activation(self, weights: np.ndarray,
+                             activation: ActivationType = ActivationType.RELU,
+                             activation_pwl: Optional[PWLTable] = None,
+                             output_path: Optional[str] = None) -> bytes:
+        """Emit a fused conv + activation .hwx.
+
+        This produces a single kernel that computes:
+            output = activation(conv1x1(input, weights))
+
+        Args:
+            weights: [out_channels, in_channels] weight matrix
+            activation: activation type (default ReLU)
+            activation_pwl: custom PWL table (for CUSTOM_PWL activation)
+            output_path: optional file path to write
+
+        Returns:
+            Complete .hwx binary
+        """
+        needs_pwl = activation in (ActivationType.SILU, ActivationType.GELU,
+                                   ActivationType.SIGMOID, ActivationType.CUSTOM_PWL)
+
+        conv_template = self.registry.get_conv_template(with_pwl=needs_pwl)
+        writer = HWXWriter(conv_template)
+
+        # Determine PWL table
+        pwl = activation_pwl
+        if pwl is None and needs_pwl:
+            target_template = self.registry.get_activation_template(activation)
+            if target_template.pwl_data:
+                pwl = PWLTable.from_bytes(target_template.pwl_data)
+
+        # Pack weights + PWL into __kern_0 using template-aware packing
+        template_kern0 = conv_template.data[
+            conv_template.kern0_offset:
+            conv_template.kern0_offset + conv_template.kern0_size]
+        kern0 = WeightPacker.pack_into_template(template_kern0, weights, pwl)
+        writer.set_kern0(kern0)
+
+        result = writer.build()
+        if output_path:
+            writer.write(output_path)
+        return result
+
+    def emit_softmax(self, params: Optional[SoftmaxParams] = None,
+                     output_path: Optional[str] = None) -> bytes:
+        """Emit a softmax .hwx (5-pass: reduce_max → exp → sum → reciprocal → multiply).
+
+        The template provides the complete 5-pass __text program. The only
+        variable data is the two PWL tables in __KERN_0 (exp and reciprocal).
+        """
+        template = self.registry.get_softmax_template()
+        writer = HWXWriter(template)
+
+        if params:
+            kern0 = params.get_kern0(
+                template.data[template.kern0_offset:
+                              template.kern0_offset + template.kern0_size])
+            writer.set_kern0(kern0)
+
+        result = writer.build()
+        if output_path:
+            writer.write(output_path)
+        return result
+
+    def emit_layernorm(self, params: Optional[LayerNormParams] = None,
+                       output_path: Optional[str] = None) -> bytes:
+        """Emit a layernorm .hwx (4-pass: mean → variance → normalize → scale+shift).
+
+        The template provides the complete 4-pass __text program.
+        Constants (epsilon, 1/dim) are FP32 literals embedded in the instruction stream.
+        """
+        template = self.registry.get_layernorm_template()
+        writer = HWXWriter(template)
+
+        if params:
+            # Patch epsilon in pass 3 (word 105 in the original template)
+            # Find the epsilon constant (0x37280000 = ~1e-5 FP32)
+            passes = template.passes
+            for p in passes:
+                for i, w in enumerate(p.words):
+                    if w == 0x37280000:  # default epsilon
+                        abs_word = p.word_offset + i
+                        writer.patch_fp32_at(abs_word, params.epsilon)
+                    elif w == 0x3C800000:  # 1/dim (0.015625 = 1/64)
+                        abs_word = p.word_offset + i
+                        inv_dim = 1.0 / params.dim
+                        writer.patch_fp32_at(abs_word, inv_dim)
+
+        result = writer.build()
+        if output_path:
+            writer.write(output_path)
+        return result
+
+    def emit_ffn(self, weights_gate: np.ndarray, weights_down: np.ndarray,
+                 activation: ActivationType = ActivationType.SILU,
+                 activation_pwl: Optional[PWLTable] = None,
+                 output_path: Optional[str] = None) -> Tuple[bytes, bytes]:
+        """Emit an FFN as two .hwx files: (gate+activation, down_projection).
+
+        Computes: output = down_proj(activation(gate_proj(input)))
+
+        Each .hwx is a single ANE dispatch. Chain them via ane-dispatch
+        with IOSurface routing (output of gate feeds input of down).
+
+        Args:
+            weights_gate: [hidden, input] gate/up projection weights
+            weights_down: [output, hidden] down projection weights
+            activation: activation between the two linears (default SiLU)
+            activation_pwl: custom PWL table (for CUSTOM_PWL)
+            output_path: base path (writes .gate.hwx and .down.hwx)
+
+        Returns:
+            Tuple (gate_hwx_bytes, down_hwx_bytes)
+        """
+        gate_hwx = self.emit_conv_activation(
+            weights=weights_gate,
+            activation=activation,
+            activation_pwl=activation_pwl)
+
+        down_hwx = self.emit_conv_activation(
+            weights=weights_down,
+            activation=ActivationType.RELU)
+
+        if output_path:
+            base = Path(output_path)
+            base.with_suffix('.gate.hwx').write_bytes(gate_hwx)
+            base.with_suffix('.down.hwx').write_bytes(down_hwx)
+
+        return gate_hwx, down_hwx
+
+    def list_templates(self) -> Dict[str, str]:
+        """List all available templates and their classes."""
+        return {name: f"{t.template_class} ({t.text_size}B __text, "
+                      f"{t.num_passes} pass{'es' if t.num_passes > 1 else ''})"
+                for name, t in self.registry.templates.items()}
+
+
+# ═══════════════════════════════════════════════════════════════
+# CLI
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='ANE Compiler: emit .hwx binaries from model definitions')
+    parser.add_argument('--templates', required=True,
+                       help='Path to template .hwx directory (or multiple, comma-separated)')
+    parser.add_argument('--template-file', action='append', default=[],
+                       help='Load individual template .hwx (repeatable)')
+    parser.add_argument('--output', '-o', help='Output .hwx path')
+    parser.add_argument('--list-templates', action='store_true',
+                       help='List available templates')
+
+    sub = parser.add_subparsers(dest='mode')
+
+    # Activation mode
+    act_p = sub.add_parser('activation', help='Emit standalone activation')
+    act_p.add_argument('type', choices=[a.value for a in ActivationType])
+
+    # Softmax mode
+    sub.add_parser('softmax', help='Emit softmax (5-pass)')
+
+    # LayerNorm mode
+    ln_p = sub.add_parser('layernorm', help='Emit layernorm (4-pass)')
+    ln_p.add_argument('--epsilon', type=float, default=1e-5)
+    ln_p.add_argument('--dim', type=int, default=64)
+
+    # Conv mode
+    conv_p = sub.add_parser('conv', help='Emit conv + activation')
+    conv_p.add_argument('--weights', required=True, help='Weights .npy file')
+    conv_p.add_argument('--activation', default='relu',
+                       choices=[a.value for a in ActivationType])
+
+    # FFN mode
+    ffn_p = sub.add_parser('ffn', help='Emit FFN (gate+activation + down)')
+    ffn_p.add_argument('--gate-weights', required=True, help='Gate weights .npy')
+    ffn_p.add_argument('--down-weights', required=True, help='Down weights .npy')
+    ffn_p.add_argument('--activation', default='silu',
+                       choices=[a.value for a in ActivationType])
+
+    args = parser.parse_args()
+
+    # Build compiler
+    compiler = ANECompiler.__new__(ANECompiler)
+    compiler.registry = TemplateRegistry()
+    for d in args.templates.split(','):
+        d = d.strip()
+        if os.path.isdir(d):
+            compiler.registry.load_directory(d)
+    for f in args.template_file:
+        compiler.registry.load_file(f)
+
+    if args.list_templates:
+        print("Available templates:")
+        for name, info in compiler.list_templates().items():
+            print(f"  {name}: {info}")
+        sys.exit(0)
+
+    if not args.output:
+        parser.error("--output is required for emission")
+
+    if args.mode == 'activation':
+        act = ActivationType(args.type)
+        hwx = compiler.emit_activation(act, args.output)
+        print(f"Emitted {act.value} activation: {len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'softmax':
+        hwx = compiler.emit_softmax(output_path=args.output)
+        print(f"Emitted softmax (5-pass): {len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'layernorm':
+        params = LayerNormParams(epsilon=args.epsilon, dim=args.dim)
+        hwx = compiler.emit_layernorm(params, output_path=args.output)
+        print(f"Emitted layernorm (eps={args.epsilon}, dim={args.dim}): "
+              f"{len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'conv':
+        w = np.load(args.weights)
+        act = ActivationType(args.activation)
+        hwx = compiler.emit_conv_activation(w, act, output_path=args.output)
+        print(f"Emitted conv+{act.value}: {len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'ffn':
+        gate_w = np.load(args.gate_weights)
+        down_w = np.load(args.down_weights)
+        act = ActivationType(args.activation)
+        gate_hwx, down_hwx = compiler.emit_ffn(
+            gate_w, down_w, activation=act, output_path=args.output)
+        print(f"Emitted FFN ({act.value}): "
+              f"gate={len(gate_hwx)}B, down={len(down_hwx)}B → {args.output}")
+
+    else:
+        parser.print_help()
