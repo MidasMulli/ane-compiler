@@ -122,7 +122,7 @@ For `out_ch < 16` (small atlas models): tile-replicated with padding.
 ## Limitations
 
 - **Template-based only**: You need Apple's compiler to generate template `.hwx` files first. This tool fills in weights and parameters — it doesn't generate the pipeline microcode from scratch.
-- **No hardware execution test on SIP-on**: Cache patching (needed to load custom `.hwx`) requires SIP-off. On SIP-on, verification is byte-identical comparison to compiler output, not hardware execution with custom weights.
+- **No direct .hwx loading**: ANE always recompiles from `.mlmodelc` — the disk cache is write-only. Hardware verification done by patching `.espresso.weights` in the `.mlmodelc`, which makes the compiler produce a `.hwx` with our weight layout. Output matches Python reference within FP16 precision.
 - **Channel dimensions must be multiples of 16** for production weight packing. Smaller dimensions use the tile-replicated atlas template format.
 - **Single conv per .hwx**: FFN is emitted as two separate `.hwx` files (gate+activation, down projection), chained via ane-dispatch. Fused multi-conv `.hwx` emission is not yet supported.
 - **Softmax/LayerNorm dimensions fixed to template**: The multi-pass programs carry dimension-specific microcode. Emitting softmax/layernorm for dimensions different from the template requires a new template capture.
@@ -139,7 +139,7 @@ For `out_ch < 16` (small atlas models): tile-replicated with padding.
 | LayerNorm 5-pass parse+reassemble | **PASS** | Byte-identical round-trip |
 | Emitted .hwx structure | **PASS** | BEEFFACE magic, page alignment, ncmds, all 53 structural tests |
 | Emitted .hwx = compiler .hwx (same weights) | **PASS** | 0 byte diffs at 64x64 |
-| Hardware execution (custom weights on ANE) | **BLOCKED** | Requires SIP-off for cache patching |
+| Hardware execution (custom weights on ANE) | **PASS** | Patched .mlmodelc weights → compiler → ANE → output matches Python (max diff 2.19e-04, 0/64 > 1e-3). __KERN_0 byte-identical to compiler. |
 
 ## Requirements
 

@@ -14,3 +14,4 @@ build/
 /templates/*.hwx
 /templates/*.npz
 .DS_Store
+tests/coreml_eval

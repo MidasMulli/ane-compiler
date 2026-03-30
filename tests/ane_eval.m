@@ -24,23 +24,29 @@ static void loadFW(void) {
 int main(int argc, char *argv[]) {
     @autoreleasepool {
         signal(SIGSEGV, SIG_IGN);
-        if (argc < 2) { fprintf(stderr, "Usage: %s <model.mlmodelc> [channels]\n", argv[0]); return 1; }
+        if (argc < 2) { fprintf(stderr, "Usage: %s <model.mlmodelc> [channels] [--load-only]\n", argv[0]); return 1; }
 
         loadFW();
         int channels = argc > 2 ? atoi(argv[2]) : 64;
+        BOOL loadOnly = NO;
+        for (int i = 1; i < argc; i++) {
+            if (strcmp(argv[i], "--load-only") == 0) loadOnly = YES;
+        }
 
         id client = ((id (*)(id, SEL))objc_msgSend)((id)_ANEClientCls, NSSelectorFromString(@"sharedConnection"));
         NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:argv[1]]];
         id model = ((id (*)(id, SEL, id, id))objc_msgSend)((id)_ANEModelCls, NSSelectorFromString(@"modelAtURL:key:"), url, @"default");
         if (!model) { fprintf(stderr, "Model failed\n"); return 1; }
 
-        // Compile + load
+        // Compile (unless --load-only) + load
         NSError *err = nil;
-        ((BOOL (*)(id, SEL, id, id, NSInteger, id*))objc_msgSend)(
-            client, NSSelectorFromString(@"compileModel:options:qos:error:"), model, @{}, 0, &err);
+        if (!loadOnly) {
+            ((BOOL (*)(id, SEL, id, id, NSInteger, id*))objc_msgSend)(
+                client, NSSelectorFromString(@"compileModel:options:qos:error:"), model, @{}, 0, &err);
+        }
         BOOL loadOK = ((BOOL (*)(id, SEL, id, id, NSInteger, id*))objc_msgSend)(
             client, NSSelectorFromString(@"loadModel:options:qos:error:"), model, @{}, 0, &err);
-        if (!loadOK) { fprintf(stderr, "Load failed\n"); return 1; }
+        if (!loadOK) { fprintf(stderr, "Load failed (loadOnly=%d)\n", loadOnly); return 1; }
 
         // Get buffer info
         id attrs = ((id (*)(id, SEL))objc_msgSend)(model, NSSelectorFromString(@"modelAttributes"));
