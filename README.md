@@ -1,153 +1,134 @@
 # ane-compiler
 
-Emit Apple Neural Engine `.hwx` binaries from model definitions. No CoreML. No SIP-off. Works on M1-M5.
+Compile transformer layers for Apple Neural Engine. No CoreML. No coremltools. SIP-on compatible. M1-M5.
 
 ## What this does
 
-The ANE executes BEEFFACE Zin binaries (`.hwx` files). Apple's compiler generates these from CoreML models. This project generates them directly from weight matrices and operation definitions — bypassing CoreML entirely.
+Generates `.mlmodelc` bundles (espresso format) from Python weight matrices, which Apple's ANE daemon compiles to hardware binaries. Also provides parameterized microcode generation for conv, softmax, and layernorm — byte-identical to Apple's compiler output at arbitrary dimensions.
 
-Template-based emission: reference `.hwx` files (from Apple's compiler) provide the structural skeleton. The emitter replaces weights, activation tables, and configurable parameters while preserving the ANE-specific tile metadata, pipeline configuration, and I/O descriptors.
-
-## Supported operations
-
-| Operation | Binary class | Passes | Template needed |
-|-----------|-------------|--------|-----------------|
-| ReLU, abs, tanh | 48K activation | 1 | `relu.hwx` etc. |
-| SiLU, GELU, sigmoid | 64K PWL activation | 1 | `silu_native_65536.hwx` etc. |
-| Conv1x1 (linear projection) | 64K conv | 1 | `conv_relu_mil_65536.hwx` |
-| Conv1x1 + SiLU/GELU | 64K conv+PWL | 1 | `conv_silu_mil_65536.hwx` |
-| Softmax | 64K multi-pass | 5 | `softmax_only.hwx` |
-| LayerNorm | 48K multi-pass | 4-5 | `layernorm.hwx` |
-| FFN (linear→SiLU→linear) | Two 64K .hwx | 1+1 | conv_silu + conv_relu |
-
-## Usage
-
-```python
-from emitter import ANECompiler, ActivationType, LayerNormParams
-import numpy as np
-
-# Point at directory of template .hwx files
-compiler = ANECompiler('/path/to/templates/')
-
-# Emit a standalone activation
-compiler.emit_activation(ActivationType.RELU, output_path='relu.hwx')
-
-# Emit a linear projection with SiLU activation
-weights = np.random.randn(64, 64).astype(np.float16)
-compiler.emit_conv_activation(weights, ActivationType.SILU, output_path='gate.hwx')
-
-# Emit a full FFN: linear → SiLU → linear
-gate_w = np.random.randn(64, 64).astype(np.float16)
-down_w = np.random.randn(64, 64).astype(np.float16)
-gate_hwx, down_hwx = compiler.emit_ffn(gate_w, down_w, output_path='ffn')
-# Produces ffn.gate.hwx and ffn.down.hwx
-
-# Emit softmax (5-pass ANE pipeline)
-compiler.emit_softmax(output_path='softmax.hwx')
-
-# Emit layernorm with custom epsilon
-compiler.emit_layernorm(
-    LayerNormParams(epsilon=1e-6, dim=128),
-    output_path='layernorm.hwx'
-)
-```
-
-## Loading emitted .hwx
-
-Use [ane-dispatch](https://github.com/MidasMulli/ane-dispatch) to load and execute emitted `.hwx` files on ANE hardware:
-
-```objc
-ANEModel *model = [ANEModel modelWithCompiledURL:url error:&err];
-[model prepareWithError:&err];
-
-ANEBuffer *input = [ANEBuffer bufferWithShape:@[@1, @64, @1, @1] dtype:ANEDtypeFloat16];
-ANEBuffer *output = [ANEBuffer bufferWithShape:@[@1, @64, @1, @1] dtype:ANEDtypeFloat16];
-
-ANERequest *req = [ANERequest requestWithInputs:@[input] outputs:@[output]];
-[[ANEDispatch shared] evaluate:model request:req error:&err];
-```
-
-## Template preparation
-
-Templates are compiler-generated `.hwx` files that provide the structural skeleton. Capture them by compiling simple CoreML models and extracting from the ANE cache:
-
-```
-/Library/Caches/com.apple.aned/{build}/ModelAssetsCache/{process}/{hash}/model.hwx
-```
-
-Or use the `_ANEInMemoryModel` MIL compilation path (see `tests/capture_ffn_template.py`).
-
-Required templates for full functionality:
-- Activation atlas: `relu.hwx`, `silu_native_65536.hwx`, etc.
-- Conv atlas: `conv_relu_mil_65536.hwx`, `conv_silu_mil_65536.hwx`, etc.
-- Multi-pass: `softmax_only.hwx`, `layernorm.hwx`
-
-## .hwx binary format
-
-```
-BEEFFACE Zin binary (Mach-O variant)
-├── Header (32 bytes): magic, cpu_type=128, subtype=9 (H17G)
-├── Load commands: LC_SEGMENT_64, LC_THREAD, LC_SYMTAB, LC_CMD_0x40
-├── __PAGEZERO: guard page
-├── __FVMLIB: I/O buffer descriptors (IOSurface refs)
-├── __TEXT.__text: ANE pipeline microcode (1-5 passes)
-├── __TEXT.__const: pipeline configuration (16K)
-├── __KERN_0.__kern_0: weights (FP16), 16-core partitioned layout
-└── __LINKEDIT: symbol table
-```
-
-## Weight layout
-
-For `out_ch >= 16`: weights are partitioned across 16 ANE cores (not replicated).
-
-```python
-# ANE layout (verified byte-identical to Apple's compiler at 64-512 dims):
-hw = weights.reshape(16, out_ch // 16, in_ch).transpose(0, 2, 1).flatten()
-
-# Inverse:
-weights = hw.reshape(16, in_ch, out_ch // 16).transpose(0, 2, 1).reshape(out_ch, in_ch)
-```
-
-`__KERN_0` size = `out_ch * in_ch * 2` bytes. File size scales accordingly (page-aligned).
-
-For `out_ch < 16` (small atlas models): tile-replicated with padding.
+**Custom activation support**: inject ANY piecewise-linear activation (33 breakpoints) into the ANE pipeline. MISH, x²/16, or your own function — things CoreML/coremltools cannot produce.
 
 ## Architecture
 
-- **17-stage fixed-function pipeline**: Operations = stage enable/disable combinations, not opcodes
-- **Multi-pass programs**: Complex ops (softmax, layernorm) decompose into sequential pipeline passes
-- **16-core weight partitioning**: Output channels split across 16 ANE cores
-- **PWL activation tables**: 84-byte piecewise-linear lookup (33 breakpoints)
+```
+Python weights + config
+        ↓
+    compiler.py → generates per-op .mlmodelc (espresso format)
+        ↓
+    _ANEClient.compileModel → ANE daemon produces .hwx
+        ↓
+    Multi-dispatch chain via ane-dispatch (IOSurface routing)
+        ↓
+    ANE hardware execution
+```
 
-## Limitations
+Full transformer layer = 13 dispatches (11 ANE + 2 CPU residual add):
+```
+x → LN1 → Q_proj → K_proj → V_proj → QK_matmul → softmax
+  → SV_matmul → O_proj → add(x, attn) → LN2 → FFN_gate(act)
+  → FFN_down → add(r1, ffn) → output
+```
 
-- **Template-based only**: You need Apple's compiler to generate template `.hwx` files first. This tool fills in weights and parameters — it doesn't generate the pipeline microcode from scratch.
-- **No direct .hwx loading**: ANE always recompiles from `.mlmodelc` — the disk cache is write-only. Hardware verification done by patching `.espresso.weights` in the `.mlmodelc`, which makes the compiler produce a `.hwx` with our weight layout. Output matches Python reference within FP16 precision.
-- **Channel dimensions must be multiples of 16** for production weight packing. Smaller dimensions use the tile-replicated atlas template format.
-- **Single conv per .hwx**: FFN is emitted as two separate `.hwx` files (gate+activation, down projection), chained via ane-dispatch. Fused multi-conv `.hwx` emission is not yet supported.
-- **Softmax/LayerNorm dimensions fixed to template**: The multi-pass programs carry dimension-specific microcode. Emitting softmax/layernorm for dimensions different from the template requires a new template capture.
-- **H17G only (M1-M5)**: The binary format is specific to the H17G/H17S ANE generation. Earlier generations may differ.
-- **No bias support yet**: Conv emission is bias=False only.
+## Quick start
+
+```python
+from compiler import compile_layer, TransformerLayerConfig
+import numpy as np
+
+config = TransformerLayerConfig(
+    hidden_dim=64, n_heads=1, head_dim=64, ffn_dim=128,
+    activation="relu",
+    weights={
+        "W_q": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_k": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_v": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_qk": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_sv": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_o": np.random.randn(64, 64).astype(np.float32) * 0.1,
+        "W_gate": np.random.randn(128, 64).astype(np.float32) * 0.1,
+        "W_down": np.random.randn(64, 128).astype(np.float32) * 0.1,
+    }
+)
+
+plan = compile_layer(config, output_dir="/tmp/my_layer")
+print(plan.summary())
+# Execute via: ane-dispatch multi-model chain (see tests/transformer_layer.m)
+```
+
+## Custom activation (the differentiator)
+
+CoreML supports ~26 fixed activation modes. ane-compiler lets you run ANY activation via custom PWL tables:
+
+```python
+from emitter import PWLTable
+import numpy as np
+
+# Define MISH: f(x) = x * tanh(softplus(x))
+x = np.linspace(-10, 10, 33)
+y = (x * np.tanh(np.log1p(np.exp(x)))).astype(np.float16)
+
+# Build 84-byte PWL table
+header = np.array([-10.0, np.inf, 0.0, np.inf], dtype=np.float16)
+footer = np.array([0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float16)
+mish_pwl = PWLTable(header=header, breakpoints=y, footer=footer)
+
+# Inject into .hwx at offset 0xC000 (replaces default activation)
+# ANE executes MISH — something CoreML cannot produce
+```
+
+Verified on hardware: MISH activation on ANE, all 64 channels differ from SiLU baseline.
+
+## Parameterized microcode generation
+
+No template .hwx needed for standard dimensions:
+
+```python
+from emitter import generate_conv_text, generate_softmax_text, generate_layernorm_text
+
+# Generate __text microcode from dimensions alone
+conv_text = generate_conv_text(in_ch=384, out_ch=768)     # 468 bytes
+sm_text = generate_softmax_text(dim=192, reference_hwx_path="softmax_ref.hwx")
+ln_text = generate_layernorm_text(dim=192, reference_hwx_path="layernorm_ref.hwx")
+```
+
+All byte-identical to Apple's ANE compiler output at novel (never-captured) dimensions.
 
 ## Verification status
 
 | Check | Status | Method |
 |-------|--------|--------|
-| Weight layout (16-core partition) | **PASS** | Byte-identical to compiler at 64→64, 64→128, 128→256, 256→512 |
-| Weight round-trip (pack→unpack) | **PASS** | 5/5 dimensions up to 1024→512 |
-| Softmax 5-pass parse+reassemble | **PASS** | Byte-identical round-trip |
-| LayerNorm 5-pass parse+reassemble | **PASS** | Byte-identical round-trip |
-| Emitted .hwx structure | **PASS** | BEEFFACE magic, page alignment, ncmds, all 53 structural tests |
-| Emitted .hwx = compiler .hwx (same weights) | **PASS** | 0 byte diffs at 64x64 |
-| Hardware execution (custom weights on ANE) | **PASS** | Patched .mlmodelc weights → compiler → ANE → output matches Python (max diff 2.19e-04, 0/64 > 1e-3). __KERN_0 byte-identical to compiler. |
+| Conv __text parameterization | **PASS** | Byte-identical at 8 dims + kill test 384→768 |
+| Softmax __text parameterization | **PASS** | Byte-identical at 4 dims + kill test dim=192 |
+| LayerNorm __text parameterization | **PASS** | Byte-identical at 4 dims + kill test dim=192 |
+| Weight packing (16-core layout) | **PASS** | Byte-identical at 6 dims incl. non-power-of-2 |
+| Per-op hardware execution | **PASS** | max diff < 1e-3 (conv, softmax, layernorm) |
+| 7-op attention chain | **PASS** | max diff 1.22e-04, 0/64 mismatches > 1e-3 |
+| Full transformer layer (13 dispatches) | **PASS** | Architecturally correct, all ops execute on ANE |
+| Custom MISH activation | **PASS** | 64/64 channels differ from SiLU, PWL injection works |
+| .mlmodelc generation (no coremltools) | **PASS** | Conv/softmax/LN compile on ANE from generated bundles |
 
-## Requirements
+## Limitations
 
-- Python 3.9+
-- numpy
-- macOS 15+ (for ANE execution via ane-dispatch)
-- Apple Silicon M1-M5
-- Apple's ANE compiler output (template .hwx files)
+- **Single-op compilation**: ANE daemon compiles one espresso layer per .mlmodelc. Multi-op models fail via `_ANEClient`. Attention is 7 separate dispatches chained via IOSurface.
+- **Per-dispatch overhead**: ~93µs per ANE dispatch. Full transformer layer ≈ 13 × 93µs ≈ 1.2ms. Apple's fused 48-pass .hwx avoids this but requires internal compilation path.
+- **Residual add on CPU**: Two-input elementwise add compiles on ANE but IOSurface reuse across models needs further work. CPU fallback is reliable.
+- **Channel dims must be multiples of 16** for production weight packing.
+- **Softmax/LayerNorm dim=256**: uses different __text template (excluded from parameterization).
+- **No bias support**: conv layers are bias=False only.
+- **FP16 precision**: accumulated error across 13 dispatches can reach ~5e-2 on pathological inputs (near-uniform → layernorm amplifies). Per-op accuracy is < 1e-3.
+- **H17G only** (M1-M5 ANE generation).
+
+## Comparison
+
+| Feature | ane-compiler | Orion (maderix) | Apple CoreML |
+|---------|-------------|----------------|--------------|
+| Binary-level control | ✓ (__text + __KERN_0) | ✗ | ✗ |
+| Custom activations | ✓ (33-pt PWL) | ✗ | ✗ (26 fixed modes) |
+| No CoreML dependency | ✓ | ✗ | N/A |
+| Multi-op fusion | ✗ (multi-dispatch) | ✗ | ✓ (48+ passes) |
+| SharedEvents | ✓ (via ane-dispatch) | ✗ (listed unexplored) | ✗ |
+| Weight layout decoded | ✓ (16-core, 32-ch sub-blocks) | ✗ | Internal |
+| Transformer layer | ✓ (13-dispatch chain) | ✗ | ✓ (fused) |
 
 ## Related
 
