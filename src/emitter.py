@@ -58,6 +58,111 @@ PASS_BOUNDARY_ALT2 = 0x00FFF868 # First-pass header variant
 OUTPUT_DMA = 0x83119640         # Output writeback opcode
 PROGRAM_TERM1 = 0x22001440      # Program terminator word 1
 PROGRAM_TERM2 = 0x01040021      # Program terminator word 2
+NUM_ANE_CORES = 16              # H17G/H17S have 16 cores
+
+# ═══════════════════════════════════════════════════════════════
+# Parameterized conv __text generation (no template needed)
+# ═══════════════════════════════════════════════════════════════
+
+# 117-word __text template for conv1x1 (all dims ≥64, output ≠ 128 or input > 128)
+# Fixed words extracted from compiler output at 8 dimension pairs.
+# Parameterized words filled by generate_conv_text().
+_CONV_TEXT_FIXED = [
+    0x00000001, 0x00000000, 0x00000000, 0x00000000,  # W[0-3]
+    0x00710000, None,       0x04000068, 0x00000000,  # W[4-7]    W[5]=param
+    0x00FFF868, 0x00000000, 0x00000000, 0x00000000,  # W[8-11]
+    0x00050009, 0xFFC01540, 0x000102C0, 0x00000021,  # W[12-15]
+    0x00000021, 0x00000021, 0x00000021, 0x00000021,  # W[16-19]  tile desc header
+    0x00000021, 0x00000021, 0x00000021, 0x00000021,  # W[20-23]
+    0x00031551, 0x00000021, 0x00000021, 0x00000021,  # W[24-27]
+    0x00000021, 0x00000021, 0x00000021, 0x00000021,  # W[28-31]
+    0x000F1559, None,       None,       None,         # W[32-35]  W[33-47]=tile offsets
+    None,       None,       None,       None,         # W[36-39]
+    None,       None,       None,       None,         # W[40-43]
+    None,       None,       None,       None,         # W[44-47]
+    None,       None,       None,       None,         # W[48-51]  W[48-63]=tile stride
+    None,       None,       None,       None,         # W[52-55]
+    None,       None,       None,       None,         # W[56-59]
+    None,       None,       None,       None,         # W[60-63]
+    0x00010001, 0x00000001, 0x00000001, None,         # W[64-67]  W[67]=ic
+    0x93418005, 0x00000001, 0x00000001, None,         # W[68-71]  W[71]=oc
+    0x00000001, None,       None,       0x00200000,   # W[72-75]  W[73,74]=param
+    0x80081342, 0x000000CE, 0x00000040, 0x0000135A,   # W[76-79]
+    0x01002031, 0x00009041, 0x00500172, 0x00500130,   # W[80-83]
+    0x98039045, 0x00000010, None,       None,         # W[84-87]  W[86-88]=ic_stride
+    None,       0x0050017A, None,       0x80049240,   # W[88-91]  W[90]=ic_stride
+    0x10000082, 0x00103C00, 0x00003C00, 0x80801445,   # W[92-95]
+    0x00000040, 0x01302031, 0x83109640, 0x00000012,   # W[96-99]
+    0x00A000A0, 0x00000000, 0x007F0000, 0x20010701,   # W[100-103]
+    0x24009544, 0x00000000, 0x00000000, 0x23009344,   # W[104-107]
+    0x00000000, 0x00000000, 0x23809442, 0x00000000,   # W[108-111]
+    0x00000000, 0x22001340, 0x00000021, 0x22001440,   # W[112-115]
+    0x01000021,                                        # W[116]
+]
+
+
+def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
+    """Generate conv1x1 __text microcode from dimensions alone.
+
+    Produces the 117-word (468-byte) ANE pipeline program for a
+    conv1x1 operation. No template .hwx needed.
+
+    Formulas decoded from 8 compiler captures (64→64 through 1024→1024):
+      W[5]      = tile_size // 4096
+      W[33-47]  = tile_size * (i - 32)  [16-core tile offset table]
+      W[48-63]  = tile_size             [uniform tile stride]
+      W[67]     = in_ch
+      W[71]     = out_ch
+      W[73]     = 0x200004 (fixed for dims ≤ 512; 0x240004 at 1024)
+      W[74]     = min(ceil(log2(out_ch / 16)), 5)
+      W[86-88,90] = in_ch * 16
+
+    Args:
+        in_ch: input channels (must be ≥ 64, multiple of 16)
+        out_ch: output channels (must be ≥ 64, multiple of 16, ≠ 128 unless in_ch > 128)
+
+    Returns:
+        468 bytes of __text microcode
+    """
+    import math
+
+    tile_size = in_ch * out_ch * 2 // NUM_ANE_CORES
+    ic_stride = in_ch * NUM_ANE_CORES  # = in_ch * 16
+
+    words = list(_CONV_TEXT_FIXED)
+
+    # W[5]: tile pages
+    words[5] = tile_size // 4096
+
+    # W[33]-W[47]: tile offset table (16 entries)
+    for i in range(16):
+        words[33 + i] = tile_size * (i + 1)
+
+    # W[48]-W[63]: tile stride (uniform)
+    for i in range(16):
+        words[48 + i] = tile_size
+
+    # W[67]: input channels
+    words[67] = in_ch
+
+    # W[71]: output channels
+    words[71] = out_ch
+
+    # W[73]: pipeline config (0x200004 for ic < 1024; 0x244404 at ic ≥ 1024)
+    words[73] = 0x200004 if in_ch < 1024 else 0x244404
+
+    # W[74]: pipeline depth = min(ceil(log2(out_ch / 16)), 5)
+    words[74] = min(math.ceil(math.log2(out_ch / 16)), 5)
+
+    # W[86,87,88,90]: input DMA stride (ic*16; anomaly +0x30 at ic ≥ 1024)
+    ic_dma = ic_stride if in_ch < 1024 else ic_stride + 0x30
+    words[86] = ic_dma
+    words[87] = ic_stride  # W[87] stays clean even at 1024
+    words[88] = ic_stride  # W[88] stays clean even at 1024
+    words[90] = ic_dma     # W[90] matches W[86]
+
+    return struct.pack(f'<{len(words)}I', *words)
+
 
 # File regions for template-based emission
 class Region(Enum):
@@ -537,6 +642,17 @@ class WeightPacker:
     def pack_conv1x1(weights: np.ndarray) -> bytes:
         """Pack conv1x1 weights into ANE __KERN_0 layout.
 
+        The ANE uses a 16-core tiled layout with 32-channel sub-blocks:
+          block = out_ch // 16  (output channels per core)
+          sub1 = min(32, block)  (first sub-block size)
+          sub2 = block - sub1    (second sub-block, 0 if block ≤ 32)
+
+        For block ≤ 32 (out_ch ≤ 512): single sub-block per tile, column-major.
+        For block > 32 (out_ch > 512): two sub-blocks (32 + remainder) per tile.
+
+        Verified byte-identical to Apple's ANE compiler at:
+        64→64, 64→128, 128→256, 256→512, 384→768, 512→1024.
+
         Args:
             weights: [out_channels, in_channels] weight matrix
 
@@ -546,15 +662,25 @@ class WeightPacker:
         w = weights.astype(np.float16)
         out_ch, in_ch = w.shape
 
-        if out_ch >= WeightPacker.NUM_CORES and out_ch % WeightPacker.NUM_CORES == 0:
-            # Production layout: 16-core partitioned
-            block = out_ch // WeightPacker.NUM_CORES
-            packed = w.reshape(WeightPacker.NUM_CORES, block, in_ch)
-            packed = packed.transpose(0, 2, 1)  # [16, in_ch, block]
-            return packed.flatten().tobytes()
-        else:
-            # Small model: simple flattened (template-based padding handled elsewhere)
+        if out_ch < WeightPacker.NUM_CORES or out_ch % WeightPacker.NUM_CORES != 0:
             return w.flatten().tobytes()
+
+        block = out_ch // WeightPacker.NUM_CORES
+        sub1 = min(32, block)
+        sub2 = block - sub1
+        split_point = WeightPacker.NUM_CORES * sub1
+
+        result = []
+        for t in range(WeightPacker.NUM_CORES):
+            # First sub-block: column-major (Fortran order)
+            first = w[t * sub1:(t + 1) * sub1, :]
+            result.append(first.flatten(order='F'))
+            # Second sub-block (if block > 32)
+            if sub2 > 0:
+                second = w[split_point + t * sub2:split_point + (t + 1) * sub2, :]
+                result.append(second.flatten(order='F'))
+
+        return np.concatenate(result).tobytes()
 
     @staticmethod
     def unpack_conv1x1(kern0_data: bytes, out_ch: int, in_ch: int) -> np.ndarray:
@@ -564,13 +690,30 @@ class WeightPacker:
         """
         hw = np.frombuffer(kern0_data[:out_ch * in_ch * 2], dtype=np.float16)
 
-        if out_ch >= WeightPacker.NUM_CORES and out_ch % WeightPacker.NUM_CORES == 0:
-            block = out_ch // WeightPacker.NUM_CORES
-            w = hw.reshape(WeightPacker.NUM_CORES, in_ch, block)
-            w = w.transpose(0, 2, 1)  # [16, block, in_ch]
-            return w.reshape(out_ch, in_ch)
-        else:
+        if out_ch < WeightPacker.NUM_CORES or out_ch % WeightPacker.NUM_CORES != 0:
             return hw.reshape(out_ch, in_ch)
+
+        block = out_ch // WeightPacker.NUM_CORES
+        sub1 = min(32, block)
+        sub2 = block - sub1
+        split_point = WeightPacker.NUM_CORES * sub1
+
+        w = np.zeros((out_ch, in_ch), dtype=np.float16)
+        offset = 0
+        for t in range(WeightPacker.NUM_CORES):
+            # First sub-block
+            chunk_sz = sub1 * in_ch
+            chunk = hw[offset:offset + chunk_sz].reshape(in_ch, sub1, order='C')
+            w[t * sub1:(t + 1) * sub1, :] = chunk.T
+            offset += chunk_sz
+            # Second sub-block
+            if sub2 > 0:
+                chunk_sz = sub2 * in_ch
+                chunk = hw[offset:offset + chunk_sz].reshape(in_ch, sub2, order='C')
+                w[split_point + t * sub2:split_point + (t + 1) * sub2, :] = chunk.T
+                offset += chunk_sz
+
+        return w
 
     @staticmethod
     def compute_kern0_size(out_ch: int, in_ch: int) -> int:
