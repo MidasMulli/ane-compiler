@@ -131,8 +131,9 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
 
     words = list(_CONV_TEXT_FIXED)
 
-    # W[5]: tile pages
-    words[5] = tile_size // 4096
+    # W[5]: tile pages — floor for small tiles, ceil for large
+    # tile < 4096: 0 (single page), tile >= 4096: ceil(tile/4096)
+    words[5] = 0 if tile_size < 4096 else (tile_size + 4095) // 4096
 
     # W[33]-W[47]: tile offset table (16 entries)
     for i in range(16):
@@ -148,17 +149,17 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
     # W[71]: output channels
     words[71] = out_ch
 
-    # W[73]: pipeline config (0x200004 for ic < 1024; 0x244404 at ic ≥ 1024)
-    words[73] = 0x200004 if in_ch < 1024 else 0x244404
+    # W[73]: pipeline config (0x200004 for ic ≤ 640; 0x244404 at ic ≥ 768)
+    words[73] = 0x200004 if in_ch <= 640 else 0x244404
 
     # W[74]: pipeline depth = min(ceil(log2(out_ch / 16)), 5)
     words[74] = min(math.ceil(math.log2(out_ch / 16)), 5)
 
-    # W[86,87,88,90]: input DMA stride (ic*16; anomaly +0x30 at ic ≥ 1024)
-    ic_dma = ic_stride if in_ch < 1024 else ic_stride + 0x30
+    # W[86,87,88,90]: input DMA stride (ic*16; +0x30 at ic ≥ 768)
+    ic_dma = ic_stride if in_ch <= 640 else ic_stride + 0x30
     words[86] = ic_dma
-    words[87] = ic_stride  # W[87] stays clean even at 1024
-    words[88] = ic_stride  # W[88] stays clean even at 1024
+    words[87] = ic_stride  # W[87] stays clean
+    words[88] = ic_stride  # W[88] stays clean
     words[90] = ic_dma     # W[90] matches W[86]
 
     return struct.pack(f'<{len(words)}I', *words)
