@@ -1,12 +1,16 @@
 # ane-compiler
 
-Compile transformer layers for Apple Neural Engine. No CoreML. No coremltools. SIP-on compatible. M1-M5.
+Direct compiler for Apple Neural Engine. You control every byte.
 
-## What this does
+CoreML is "we'll handle it." ane-compiler is "you handle it — and you can see every byte that hits the hardware."
 
-Generates `.mlmodelc` bundles (espresso format) from Python weight matrices, which Apple's ANE daemon compiles to hardware binaries. Also provides parameterized microcode generation for conv, softmax, and layernorm — byte-identical to Apple's compiler output at arbitrary dimensions.
+## Why this exists
 
-**Custom activation support**: inject ANY piecewise-linear activation (33 breakpoints) into the ANE pipeline. MISH, x²/16, or your own function — things CoreML/coremltools cannot produce.
+Apple's ANE is a 12 TFLOPS FP16 accelerator sitting in every Mac and iPhone. But the only official way to use it is CoreML — a black box that decides what runs where, how weights are laid out, and which activations are available. You get 26 fixed activation modes. You get whatever compilation strategy Apple chose. You get no visibility into the binary that actually executes.
+
+ane-compiler opens the box. It generates ANE programs directly from weight matrices. It decodes the hardware weight layout (16-core partitioned, 32-channel sub-blocks, column-major — all reverse-engineered and verified byte-identical to Apple's compiler). It lets you inject custom piecewise-linear activations that CoreML cannot produce. And it gives you a complete transformer layer running on ANE through multi-dispatch chaining — no CoreML in the loop.
+
+This is not a CoreML replacement for production model deployment. It's a research tool for people who need to understand and control what the ANE is actually doing.
 
 ## Architecture
 
@@ -118,17 +122,20 @@ All byte-identical to Apple's ANE compiler output at novel (never-captured) dime
 - **FP16 precision**: accumulated error across 13 dispatches can reach ~5e-2 on pathological inputs (near-uniform → layernorm amplifies). Per-op accuracy is < 1e-3.
 - **H17G only** (M1-M5 ANE generation).
 
-## Comparison
+## The trade-off
 
-| Feature | ane-compiler | Orion (maderix) | Apple CoreML |
-|---------|-------------|----------------|--------------|
-| Binary-level control | ✓ (__text + __KERN_0) | ✗ | ✗ |
-| Custom activations | ✓ (33-pt PWL) | ✗ | ✗ (26 fixed modes) |
-| No CoreML dependency | ✓ | ✗ | N/A |
-| Multi-op fusion | ✗ (multi-dispatch) | ✗ | ✓ (48+ passes) |
-| SharedEvents | ✓ (via ane-dispatch) | ✗ (listed unexplored) | ✗ |
-| Weight layout decoded | ✓ (16-core, 32-ch sub-blocks) | ✗ | Internal |
-| Transformer layer | ✓ (13-dispatch chain) | ✗ | ✓ (fused) |
+CoreML compiles faster, fuses better (48+ passes in one dispatch), and handles the full model zoo. It's the right choice when you want to deploy a standard model and don't care what happens inside.
+
+ane-compiler is the right choice when you do care. When you need a custom activation. When you need to verify what the hardware is computing. When you're researching the ANE architecture itself. When "it works" isn't enough and you need to know *why* it works — or why it doesn't.
+
+| | ane-compiler | Apple CoreML |
+|---|---|---|
+| **You control** | Weight layout, activation tables, pipeline microcode, dispatch ordering | Model format |
+| **You can see** | Every byte in __text, __KERN_0, load commands, IOSurface routing | A .mlmodelc directory |
+| **Custom activations** | Any 33-breakpoint PWL (MISH, x²/16, yours) | 26 fixed modes |
+| **Multi-op fusion** | No (13 dispatches per transformer layer) | Yes (48+ passes fused) |
+| **Dependencies** | numpy, ane-dispatch | CoreML framework, coremltools |
+| **Best for** | Research, custom ops, ANE understanding | Production deployment |
 
 ## Related
 
