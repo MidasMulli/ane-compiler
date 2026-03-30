@@ -164,6 +164,71 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
     return struct.pack(f'<{len(words)}I', *words)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Parameterized softmax __text generation
+# ═══════════════════════════════════════════════════════════════
+
+# 257-word template for softmax (dims 32, 64, 128, 512 — all except 256 which is 253w)
+# 22 parameterized words, 235 fixed. PWL tables in __KERN_0 are dimension-independent.
+_SOFTMAX_TEXT_FIXED = None  # Loaded lazily from reference
+
+def generate_softmax_text(dim: int, reference_hwx_path: Optional[str] = None) -> bytes:
+    """Generate softmax __text microcode from channel dimension alone.
+
+    Softmax decomposes into 5 ANE pipeline passes:
+      1. reduce_max  2. exp(x-max)  3. reduce_sum  4. reciprocal  5. multiply
+
+    The 257-word (1028-byte) __text is parameterized by channel dim only.
+    PWL tables (exp + reciprocal) in __KERN_0 are dimension-independent.
+
+    Formulas decoded from 4 compiler captures (dim=32, 64, 128, 512):
+      W[5]          = dim // 512
+      W[16,64,68,120,124,182,222,226] = dim
+      W[21]         = (dim << 16) | 0x4000
+      W[35,78]      = dim * 18 + 16
+      W[37,38,39,81,134,197,236] = dim * 16
+      W[41,80]      = dim * 18
+      W[239]        = dim * 16 + 16
+
+    Args:
+        dim: channel dimension (must be power of 2, ≥ 32, ≠ 256)
+        reference_hwx_path: path to a reference softmax .hwx for the template
+
+    Returns:
+        1028 bytes of __text microcode
+    """
+    global _SOFTMAX_TEXT_FIXED
+    if _SOFTMAX_TEXT_FIXED is None:
+        if reference_hwx_path:
+            data = Path(reference_hwx_path).read_bytes()
+            _SOFTMAX_TEXT_FIXED = list(struct.unpack('<257I', data[0x4000:0x4000 + 1028]))
+        else:
+            raise ValueError("First call to generate_softmax_text requires reference_hwx_path")
+
+    words = list(_SOFTMAX_TEXT_FIXED)
+
+    # Apply parameterization
+    words[5] = dim // 512
+
+    for wi in [16, 64, 68, 120, 124, 182, 222, 226]:
+        words[wi] = dim
+
+    words[21] = (dim << 16) | 0x4000
+
+    for wi in [35, 78]:
+        words[wi] = dim * 18 + 16
+
+    for wi in [37, 38, 39, 81, 134, 197, 236]:
+        words[wi] = dim * 16
+
+    for wi in [41, 80]:
+        words[wi] = dim * 18
+
+    words[239] = dim * 16 + 16
+
+    return struct.pack(f'<{len(words)}I', *words)
+
+
 # File regions for template-based emission
 class Region(Enum):
     HEADER = "header"           # 0x0000-0x001F (32 bytes, fixed)
