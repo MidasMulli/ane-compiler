@@ -1,5 +1,9 @@
 __pycache__/
 *.pyc
+# Compiled test binaries
+tests/ane_eval
+tests/capture_and_eval
+tests/hw_gate_test
 *.pyo
 *.egg-info/
 dist/

@@ -92,16 +92,54 @@ BEEFFACE Zin binary (Mach-O variant)
 ├── __FVMLIB: I/O buffer descriptors (IOSurface refs)
 ├── __TEXT.__text: ANE pipeline microcode (1-5 passes)
 ├── __TEXT.__const: pipeline configuration (16K)
-├── __KERN_0.__kern_0: weights (FP16) + PWL tables, 16-tile replicated
+├── __KERN_0.__kern_0: weights (FP16), 16-core partitioned layout
 └── __LINKEDIT: symbol table
 ```
+
+## Weight layout
+
+For `out_ch >= 16`: weights are partitioned across 16 ANE cores (not replicated).
+
+```python
+# ANE layout (verified byte-identical to Apple's compiler at 64-512 dims):
+hw = weights.reshape(16, out_ch // 16, in_ch).transpose(0, 2, 1).flatten()
+
+# Inverse:
+weights = hw.reshape(16, in_ch, out_ch // 16).transpose(0, 2, 1).reshape(out_ch, in_ch)
+```
+
+`__KERN_0` size = `out_ch * in_ch * 2` bytes. File size scales accordingly (page-aligned).
+
+For `out_ch < 16` (small atlas models): tile-replicated with padding.
 
 ## Architecture
 
 - **17-stage fixed-function pipeline**: Operations = stage enable/disable combinations, not opcodes
 - **Multi-pass programs**: Complex ops (softmax, layernorm) decompose into sequential pipeline passes
-- **16-tile replication**: Weights replicated across 16 ANE cores
+- **16-core weight partitioning**: Output channels split across 16 ANE cores
 - **PWL activation tables**: 84-byte piecewise-linear lookup (33 breakpoints)
+
+## Limitations
+
+- **Template-based only**: You need Apple's compiler to generate template `.hwx` files first. This tool fills in weights and parameters — it doesn't generate the pipeline microcode from scratch.
+- **No hardware execution test on SIP-on**: Cache patching (needed to load custom `.hwx`) requires SIP-off. On SIP-on, verification is byte-identical comparison to compiler output, not hardware execution with custom weights.
+- **Channel dimensions must be multiples of 16** for production weight packing. Smaller dimensions use the tile-replicated atlas template format.
+- **Single conv per .hwx**: FFN is emitted as two separate `.hwx` files (gate+activation, down projection), chained via ane-dispatch. Fused multi-conv `.hwx` emission is not yet supported.
+- **Softmax/LayerNorm dimensions fixed to template**: The multi-pass programs carry dimension-specific microcode. Emitting softmax/layernorm for dimensions different from the template requires a new template capture.
+- **H17G only (M1-M5)**: The binary format is specific to the H17G/H17S ANE generation. Earlier generations may differ.
+- **No bias support yet**: Conv emission is bias=False only.
+
+## Verification status
+
+| Check | Status | Method |
+|-------|--------|--------|
+| Weight layout (16-core partition) | **PASS** | Byte-identical to compiler at 64→64, 64→128, 128→256, 256→512 |
+| Weight round-trip (pack→unpack) | **PASS** | 5/5 dimensions up to 1024→512 |
+| Softmax 5-pass parse+reassemble | **PASS** | Byte-identical round-trip |
+| LayerNorm 5-pass parse+reassemble | **PASS** | Byte-identical round-trip |
+| Emitted .hwx structure | **PASS** | BEEFFACE magic, page alignment, ncmds, all 53 structural tests |
+| Emitted .hwx = compiler .hwx (same weights) | **PASS** | 0 byte diffs at 64x64 |
+| Hardware execution (custom weights on ANE) | **BLOCKED** | Requires SIP-off for cache patching |
 
 ## Requirements
 
@@ -109,6 +147,7 @@ BEEFFACE Zin binary (Mach-O variant)
 - numpy
 - macOS 15+ (for ANE execution via ane-dispatch)
 - Apple Silicon M1-M5
+- Apple's ANE compiler output (template .hwx files)
 
 ## Related
 

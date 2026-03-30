@@ -514,81 +514,108 @@ class TemplateRegistry:
 # ═══════════════════════════════════════════════════════════════
 
 class WeightPacker:
-    """Pack model weights into ANE __KERN_0 tile-replicated format.
+    """Pack model weights into ANE __KERN_0 format.
 
-    ANE __KERN_0 is organized as 16 tiles (one per ANE core).
-    Each tile is identical except for per-tile metadata bytes.
+    The ANE weight layout depends on the output channel count:
 
-    Tile layouts (determined from compiler output analysis):
-      - conv_only/relu: 512B/tile. Weights at offset 0. No PWL.
-      - conv_silu/gelu: 640B/tile. PWL (84B) at offset 0, weights at offset 128.
-      - conv_sigmoid:   640B/tile. PWL (84B) at offset 0, weights at offset 128.
+    For out_ch >= 16 (production scale):
+        Weights are partitioned across 16 ANE cores. No tile replication.
+        __KERN_0 size = out_ch * in_ch * 2 bytes exactly.
+        Layout: ref_w.reshape(16, out_ch//16, in_ch).transpose(0, 2, 1).flatten()
+        i.e., [core_group, in_ch, sub_out_ch] interleave.
 
-    Tile metadata diffs (bytes 1, 11, 21, 31 + one per-tile-index byte)
-    are preserved from the template — we only overwrite weight/PWL regions.
+    For out_ch < 16 (small models, atlas templates):
+        Tile-replicated format with padding. Template-specific layout.
+        Each tile = kern0_size // 16, weights padded to PlaneStride boundaries.
+
+    Verified against Apple ANE compiler output at 64→64, 64→128,
+    128→256, and 256→512 dimensions (sentinel weight round-trip).
     """
-    NUM_TILES = 16
+    NUM_CORES = 16
+
+    @staticmethod
+    def pack_conv1x1(weights: np.ndarray) -> bytes:
+        """Pack conv1x1 weights into ANE __KERN_0 layout.
+
+        Args:
+            weights: [out_channels, in_channels] weight matrix
+
+        Returns:
+            Packed bytes for __KERN_0 section
+        """
+        w = weights.astype(np.float16)
+        out_ch, in_ch = w.shape
+
+        if out_ch >= WeightPacker.NUM_CORES and out_ch % WeightPacker.NUM_CORES == 0:
+            # Production layout: 16-core partitioned
+            block = out_ch // WeightPacker.NUM_CORES
+            packed = w.reshape(WeightPacker.NUM_CORES, block, in_ch)
+            packed = packed.transpose(0, 2, 1)  # [16, in_ch, block]
+            return packed.flatten().tobytes()
+        else:
+            # Small model: simple flattened (template-based padding handled elsewhere)
+            return w.flatten().tobytes()
+
+    @staticmethod
+    def unpack_conv1x1(kern0_data: bytes, out_ch: int, in_ch: int) -> np.ndarray:
+        """Unpack weights from ANE __KERN_0 layout back to [out_ch, in_ch].
+
+        Inverse of pack_conv1x1.
+        """
+        hw = np.frombuffer(kern0_data[:out_ch * in_ch * 2], dtype=np.float16)
+
+        if out_ch >= WeightPacker.NUM_CORES and out_ch % WeightPacker.NUM_CORES == 0:
+            block = out_ch // WeightPacker.NUM_CORES
+            w = hw.reshape(WeightPacker.NUM_CORES, in_ch, block)
+            w = w.transpose(0, 2, 1)  # [16, block, in_ch]
+            return w.reshape(out_ch, in_ch)
+        else:
+            return hw.reshape(out_ch, in_ch)
+
+    @staticmethod
+    def compute_kern0_size(out_ch: int, in_ch: int) -> int:
+        """Compute the __KERN_0 section size needed for given dimensions."""
+        return out_ch * in_ch * 2  # FP16
 
     @staticmethod
     def pack_into_template(template_kern0: bytes, weights: np.ndarray,
                            pwl: Optional['PWLTable'] = None) -> bytes:
-        """Pack weights (and optional PWL) into a template __KERN_0.
+        """Pack weights into a template __KERN_0 (for small/atlas models).
 
-        Preserves all tile metadata from the template. Only overwrites
-        the weight and PWL data regions within each tile.
-
-        Args:
-            template_kern0: original __KERN_0 bytes from a template .hwx
-            weights: [out_channels, in_channels] weight matrix
-            pwl: optional PWL table (for SiLU/GELU/sigmoid activations)
-
-        Returns:
-            New __KERN_0 bytes with weights and PWL replaced
+        For small models (out_ch < 16) that use tile-replicated templates,
+        this preserves tile metadata and replaces weight regions.
+        For production models, use pack_conv1x1() directly.
         """
         kern0_size = len(template_kern0)
-        tile_size = kern0_size // WeightPacker.NUM_TILES
+        out_ch, in_ch = weights.shape
+
+        if out_ch >= WeightPacker.NUM_CORES and out_ch % WeightPacker.NUM_CORES == 0:
+            # Production layout: just pack directly
+            packed = WeightPacker.pack_conv1x1(weights)
+            if len(packed) <= kern0_size:
+                buf = bytearray(kern0_size)
+                buf[:len(packed)] = packed
+                return bytes(buf)
+            else:
+                return packed  # kern0 needs to be larger than template
+
+        # Small model: tile-replicated packing
+        tile_size = kern0_size // WeightPacker.NUM_CORES
         buf = bytearray(template_kern0)
+        w_bytes = weights.astype(np.float16).flatten().tobytes()
 
-        w = weights.astype(np.float16).flatten()
-        w_bytes = w.tobytes()
+        weight_offset = 128 if pwl is not None else 0
+        pwl_bytes = pwl.to_bytes() if pwl else b''
 
-        # Determine weight offset within tile
-        if pwl is not None:
-            # PWL activations: PWL at 0-83, weights at 128+
-            weight_offset = 128
-            pwl_bytes = pwl.to_bytes()
-        else:
-            # No PWL: weights at offset 0
-            weight_offset = 0
-
-        for t in range(WeightPacker.NUM_TILES):
+        for t in range(WeightPacker.NUM_CORES):
             tile_start = t * tile_size
-
-            # Write weights
             w_start = tile_start + weight_offset
             w_end = w_start + len(w_bytes)
             if w_end <= len(buf):
                 buf[w_start:w_end] = w_bytes
+            if pwl_bytes:
+                buf[tile_start:tile_start + len(pwl_bytes)] = pwl_bytes
 
-            # Write PWL if provided
-            if pwl is not None:
-                pwl_start = tile_start
-                pwl_end = pwl_start + len(pwl_bytes)
-                if pwl_end <= len(buf):
-                    buf[pwl_start:pwl_end] = pwl_bytes
-
-        return bytes(buf)
-
-    @staticmethod
-    def pack_conv1x1_weights(weights: np.ndarray, kern0_size: int = 8192) -> bytes:
-        """Simple weight pack (no template). Creates zero-padded tiles."""
-        tile_size = kern0_size // WeightPacker.NUM_TILES
-        buf = bytearray(kern0_size)
-        w = weights.astype(np.float16).flatten()
-        w_bytes = w.tobytes()
-        for t in range(WeightPacker.NUM_TILES):
-            off = t * tile_size
-            buf[off:off + len(w_bytes)] = w_bytes
         return bytes(buf)
 
 
@@ -728,6 +755,9 @@ class ANECompiler:
         This produces a single kernel that computes:
             output = activation(conv1x1(input, weights))
 
+        For production dimensions (out_ch >= 16), weights are packed in
+        16-core partitioned layout. The .hwx file is resized to fit.
+
         Args:
             weights: [out_channels, in_channels] weight matrix
             activation: activation type (default ReLU)
@@ -737,11 +767,11 @@ class ANECompiler:
         Returns:
             Complete .hwx binary
         """
+        out_ch, in_ch = weights.shape
         needs_pwl = activation in (ActivationType.SILU, ActivationType.GELU,
                                    ActivationType.SIGMOID, ActivationType.CUSTOM_PWL)
 
         conv_template = self.registry.get_conv_template(with_pwl=needs_pwl)
-        writer = HWXWriter(conv_template)
 
         # Determine PWL table
         pwl = activation_pwl
@@ -750,17 +780,60 @@ class ANECompiler:
             if target_template.pwl_data:
                 pwl = PWLTable.from_bytes(target_template.pwl_data)
 
-        # Pack weights + PWL into __kern_0 using template-aware packing
-        template_kern0 = conv_template.data[
-            conv_template.kern0_offset:
-            conv_template.kern0_offset + conv_template.kern0_size]
-        kern0 = WeightPacker.pack_into_template(template_kern0, weights, pwl)
-        writer.set_kern0(kern0)
+        # For production dimensions, pack weights in 16-core layout
+        if out_ch >= 16 and out_ch % 16 == 0:
+            kern0_data = WeightPacker.pack_conv1x1(weights)
+        else:
+            template_kern0 = conv_template.data[
+                conv_template.kern0_offset:
+                conv_template.kern0_offset + conv_template.kern0_size]
+            kern0_data = WeightPacker.pack_into_template(template_kern0, weights, pwl)
+
+        writer = HWXWriter(conv_template)
+
+        # If kern0 is larger than template, we need to resize the file
+        needed_kern0 = len(kern0_data)
+        template_kern0_size = conv_template.kern0_size
+        if needed_kern0 > template_kern0_size:
+            # Extend the output buffer to accommodate larger __KERN_0
+            # __KERN_0 starts at kern0_offset, extends to kern0_offset + needed_kern0
+            # File must be page-aligned (4096-byte boundaries)
+            new_end = conv_template.kern0_offset + needed_kern0
+            new_size = ((new_end + 4095) // 4096) * 4096
+            extended = bytearray(new_size)
+            extended[:len(conv_template.data)] = conv_template.data
+            writer.output = extended
+
+            # Update __KERN_0 section size in the load command
+            self._patch_kern0_size(writer.output, needed_kern0, new_size)
+
+        writer.set_kern0(kern0_data)
 
         result = writer.build()
         if output_path:
-            writer.write(output_path)
+            Path(output_path).write_bytes(result)
         return result
+
+    @staticmethod
+    def _patch_kern0_size(buf: bytearray, new_kern0_size: int, new_file_size: int):
+        """Patch the __KERN_0 segment/section size and file size in load commands."""
+        ncmds = struct.unpack_from('<I', buf, 0x10)[0]
+        offset = 32
+        for _ in range(ncmds):
+            cmd = struct.unpack_from('<I', buf, offset)[0]
+            cmdsize = struct.unpack_from('<I', buf, offset + 4)[0]
+            if cmd == 0x19:  # LC_SEGMENT_64
+                segname = buf[offset+8:offset+24].split(b'\x00')[0].decode('ascii')
+                if segname == '__KERN_0':
+                    # Patch segment vmsize and filesize
+                    struct.pack_into('<Q', buf, offset + 40, new_kern0_size)  # vmsize
+                    struct.pack_into('<Q', buf, offset + 48, new_kern0_size)  # filesize
+                    # Patch section size
+                    nsects = struct.unpack_from('<I', buf, offset + 64)[0]
+                    for s in range(nsects):
+                        s_off = offset + 72 + s * 80
+                        struct.pack_into('<Q', buf, s_off + 40, new_kern0_size)  # size
+            offset += cmdsize
 
     def emit_softmax(self, params: Optional[SoftmaxParams] = None,
                      output_path: Optional[str] = None) -> bytes:
