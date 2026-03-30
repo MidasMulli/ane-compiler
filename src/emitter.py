@@ -172,6 +172,86 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
 # 22 parameterized words, 235 fixed. PWL tables in __KERN_0 are dimension-independent.
 _SOFTMAX_TEXT_FIXED = None  # Loaded lazily from reference
 
+_LAYERNORM_TEXT_FIXED = None  # Loaded lazily from reference
+
+def generate_layernorm_text(dim: int, epsilon: float = 1e-5,
+                            reference_hwx_path: Optional[str] = None) -> bytes:
+    """Generate layernorm __text microcode from channel dimension.
+
+    LayerNorm decomposes into 4-5 ANE pipeline passes (mean → variance →
+    normalize → scale+shift). The 143-word (572-byte) __text is parameterized
+    by channel dim and epsilon.
+
+    Formulas decoded from 4 captures (dim=32, 64, 128, 512):
+      W[15,19,59,63,65,94,98] = dim
+      W[41,79]                = FP32(1/dim)
+      W[81]                   = dim // 512
+      W[115]                  = dim*16 + (0x10 if dim < 64 else 0x20)
+      W[116,117]              = dim*16
+      W[120]                  = dim*16 + (0x50 if dim < 64 else 0x60)
+
+    Note: epsilon is embedded as FP32 at W[78] (default 0x37390000 ≈ 1.1e-5).
+
+    Args:
+        dim: channel dimension (≥ 32, ≠ 256 which uses different template)
+        epsilon: layernorm epsilon (default 1e-5)
+        reference_hwx_path: path to reference layernorm .hwx for template
+    """
+    global _LAYERNORM_TEXT_FIXED
+    if _LAYERNORM_TEXT_FIXED is None:
+        if reference_hwx_path:
+            data = Path(reference_hwx_path).read_bytes()
+            # Find __text
+            ncmds = struct.unpack_from('<I', data, 0x10)[0]
+            offset = 32
+            for _ in range(ncmds):
+                cmd = struct.unpack_from('<I', data, offset)[0]
+                cmdsize = struct.unpack_from('<I', data, offset + 4)[0]
+                if cmd == 0x19:
+                    segname = data[offset+8:offset+24].split(b'\x00')[0].decode('ascii')
+                    nsects = struct.unpack_from('<I', data, offset+64)[0]
+                    for s in range(nsects):
+                        s_off = offset + 72 + s * 80
+                        sectname = data[s_off:s_off+16].split(b'\x00')[0].decode('ascii')
+                        size = struct.unpack_from('<Q', data, s_off+40)[0]
+                        foff = struct.unpack_from('<I', data, s_off+48)[0]
+                        if segname == '__TEXT' and sectname == '__text':
+                            _LAYERNORM_TEXT_FIXED = list(struct.unpack(
+                                f'<{size//4}I', data[foff:foff+size]))
+                offset += cmdsize
+        else:
+            raise ValueError("First call requires reference_hwx_path")
+
+    words = list(_LAYERNORM_TEXT_FIXED)
+
+    # Channel dimension
+    for wi in [15, 19, 59, 63, 65, 94, 98]:
+        words[wi] = dim
+
+    # FP32(1/dim) — reduction scale
+    inv_dim = struct.unpack('<I', struct.pack('<f', 1.0 / dim))[0]
+    words[41] = inv_dim
+    words[79] = inv_dim
+
+    # Page config
+    words[81] = dim // 512
+
+    # DMA strides
+    offset_small = 0x10 if dim < 64 else 0x20
+    words[115] = dim * 16 + offset_small
+    words[116] = dim * 16
+    words[117] = dim * 16
+    words[120] = dim * 16 + offset_small + 0x40
+
+    # Epsilon (FP32 at W[78]) — compiler uses 0x37390000 (≈1.1e-5) for eps=1e-5
+    if abs(epsilon - 1e-5) < 1e-8:
+        words[78] = 0x37390000  # match compiler default exactly
+    else:
+        words[78] = struct.unpack('<I', struct.pack('<f', epsilon))[0]
+
+    return struct.pack(f'<{len(words)}I', *words)
+
+
 def generate_softmax_text(dim: int, reference_hwx_path: Optional[str] = None) -> bytes:
     """Generate softmax __text microcode from channel dimension alone.
 
