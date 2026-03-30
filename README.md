@@ -10,7 +10,12 @@ Apple's ANE is a 12 TFLOPS FP16 accelerator sitting in every Mac and iPhone. But
 
 ane-compiler opens the box. It generates ANE programs directly from weight matrices. It decodes the hardware weight layout (16-core partitioned, 32-channel sub-blocks, column-major — all reverse-engineered and verified byte-identical to Apple's compiler). It lets you inject custom piecewise-linear activations that CoreML cannot produce. And it gives you a complete transformer layer running on ANE through multi-dispatch chaining — no CoreML in the loop.
 
-This is not a CoreML replacement for production model deployment. It's a research tool for people who need to understand and control what the ANE is actually doing.
+This is not a CoreML replacement. It's a CoreML escape hatch. What it gives you that CoreML can't:
+
+- **Custom PWL activations** — arbitrary 33-breakpoint piecewise-linear functions on ANE hardware. MISH, x²/16, or your own. CoreML gives you 26 fixed modes.
+- **Binary-level model surgery** — patch weights or activations in compiled `.hwx` without recompilation. Swap SiLU for MISH in a running model.
+- **Deterministic inspectable compilation** — same input weights = same output bytes, every byte documented. No black-box compiler decisions.
+- **No Apple compiler dependency** — generates `.mlmodelc` bundles from scratch. Survives macOS updates that change CoreML internals.
 
 ## Architecture
 
@@ -136,6 +141,20 @@ ane-compiler is the right choice when you do care. When you need a custom activa
 | **Multi-op fusion** | No (13 dispatches per transformer layer) | Yes (48+ passes fused) |
 | **Dependencies** | numpy, ane-dispatch | CoreML framework, coremltools |
 | **Best for** | Research, custom ops, ANE understanding | Production deployment |
+
+### vs other ANE projects
+
+| | ane-compiler | [Orion](https://github.com/maderix/orion-ane) | [maderix characterization](https://github.com/maderix) |
+|---|---|---|---|
+| Approach | Binary-level: __text + __KERN_0 + load commands | Direct dispatch (IOKit) | Hardware characterization |
+| Custom activations | Yes (PWL injection) | No | No |
+| Weight layout decoded | Yes (16-core, 32-ch sub-blocks, column-major) | No | No |
+| SharedEvents | Yes (via ane-dispatch) | Listed unexplored | No |
+| Parameterized microcode | Yes (conv, softmax, layernorm) | No | No |
+| Transformer layer | Yes (13-dispatch chain) | No | No |
+| .mlmodelc generation | Yes (no coremltools) | No | No |
+
+We build on insights from both projects. Orion demonstrated direct dispatch was possible. maderix's characterization work mapped the hardware. ane-compiler goes further: decoded the binary format, parameterized the microcode, and proved custom activations work on hardware.
 
 ## Related
 
