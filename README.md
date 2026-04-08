@@ -1,166 +1,80 @@
 # ane-compiler
 
-Direct compiler for Apple Neural Engine. You control every byte.
+Compile machine learning models for the Apple Neural Engine without going through Apple's CoreML / aned compiler service. Two modes:
 
-CoreML is "we'll handle it." ane-compiler is "you handle it — and you can see every byte that hits the hardware."
+- **SIP ON** — fused-subgraph execution via `_ANEInMemoryModel` + MIL IR. 37 fused subgraphs from a 73-op GPT-2. Guaranteed ANE execution, validated by `doEvaluateDirectWithModel`.
+- **SIP OFF** — direct `.hwx` emission. Byte-identical to aned output. LLDB in-flight swap intercepts `sel=3 ProgramCreate` and overwrites the mmap'd `.hwx` before the kext reads it. Demo runs as a single command.
 
-## Why this exists
+---
 
-Apple's ANE is a 12 TFLOPS FP16 accelerator sitting in every Mac and iPhone. But the only official way to use it is CoreML — a black box that decides what runs where, how weights are laid out, and which activations are available. You get 26 fixed activation modes. You get whatever compilation strategy Apple chose. You get no visibility into the binary that actually executes.
+## Production results
 
-ane-compiler opens the box. It generates ANE programs directly from weight matrices. It decodes the hardware weight layout (16-core partitioned, 32-channel sub-blocks, column-major — all reverse-engineered and verified byte-identical to Apple's compiler). It lets you inject custom piecewise-linear activations that CoreML cannot produce. And it gives you a complete transformer layer running on ANE through multi-dispatch chaining — no CoreML in the loop.
+| Model | Dispatches | Throughput | Hardware | Notes |
+|---|---|---|---|---|
+| **GPT-2 117M** | 25 (fused from 73 ops) | **229 tok/s** | ANE via `_ANEInMemoryModel` | Custom MIL activations (Mish, GELU-tanh, squared ReLU) |
+| **Llama 3.2-1B** | 25 (25d+C combined stack) | **50.2 tok/s** | ANE | Cross-layer fusion: post_attn + pre_attn = 40 → 25 dispatches |
+| **Llama 3.1-8B Q8** | 72 | **7.9 tok/s** | ANE | FP32 residual accumulation (FP16 fails past 16 layers at dim 4096), Llama 3 RoPE scaling |
+| **Neuron 80M** | 5 | **1,064 tok/s** | ANE SRAM | FFN-only domain classifier, 905 µs/dispatch, 98.7% accuracy |
 
-This is not a CoreML replacement. It's a CoreML escape hatch. What it gives you that CoreML can't:
+**Zero GPU contention** measured: 143 tok/s GPT-2 while GPU saturated vs 145 tok/s idle = −1.2% (noise floor).
 
-- **Custom PWL activations** — arbitrary 33-breakpoint piecewise-linear functions on ANE hardware. MISH, x²/16, or your own. CoreML gives you 26 fixed modes.
-- **Binary-level model surgery** — patch weights or activations in compiled `.hwx` without recompilation. Swap SiLU for MISH in a running model.
-- **Deterministic inspectable compilation** — same input weights = same output bytes, every byte documented. No black-box compiler decisions.
-- **No Apple compiler dependency** — generates `.mlmodelc` bundles from scratch. Survives macOS updates that change CoreML internals.
+---
 
-## Architecture
+## CPU acceleration kernels (`llama_cpu_ops.c`)
 
-```
-Python weights + config
-        ↓
-    compiler.py → generates per-op .mlmodelc (espresso format)
-        ↓
-    _ANEClient.compileModel → ANE daemon produces .hwx
-        ↓
-    Multi-dispatch chain via ane-dispatch (IOSurface routing)
-        ↓
-    ANE hardware execution
-```
+`libllama_cpu_ops.dylib` ships fused C/Accelerate kernels for the parts of an LLM forward pass that don't run on the ANE:
 
-Full transformer layer = 13 dispatches (11 ANE + 2 CPU residual add):
-```
-x → LN1 → Q_proj → K_proj → V_proj → QK_matmul → softmax
-  → SV_matmul → O_proj → add(x, attn) → LN2 → FFN_gate(act)
-  → FFN_down → add(r1, ffn) → output
-```
+- `llama_gqa_attention` — fused QK^T → softmax → V via vDSP/BLAS. **78× faster** than the equivalent Python NumPy loop on a 64×64 fp16 conv.
+- `llama_rope` — plain RoPE (no scaling) via vDSP. Use a wrapper that supplies precomputed cos/sin tables for Llama-3-style scaling.
+- `llama_rms_norm` — fused RMSNorm via `vDSP_meanvv` + `vvrsqrtf`.
 
-## Quick start
+End-to-end measurement on the production 8B prompt-encode path: **6.23 → 9.9 tok/s (+59%)** after wiring `llama_gqa_attention` into `ane_extractor_8b.py:_gqa_attention`.
 
-```python
-from compiler import compile_layer, TransformerLayerConfig
-import numpy as np
+---
 
-config = TransformerLayerConfig(
-    hidden_dim=64, n_heads=1, head_dim=64, ffn_dim=128,
-    activation="relu",
-    weights={
-        "W_q": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_k": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_v": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_qk": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_sv": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_o": np.random.randn(64, 64).astype(np.float32) * 0.1,
-        "W_gate": np.random.randn(128, 64).astype(np.float32) * 0.1,
-        "W_down": np.random.randn(64, 128).astype(np.float32) * 0.1,
-    }
-)
+## What it does (architecture)
 
-plan = compile_layer(config, output_dir="/tmp/my_layer")
-print(plan.summary())
-# Execute via: ane-dispatch multi-model chain (see tests/transformer_layer.m)
-```
+The compiler walks a fused-graph IR and emits one of two outputs:
 
-## Custom activation (the differentiator)
+1. `.mlmodelc` packages with custom MIL ops, loadable by `_ANEInMemoryModel.compileWithQoS:` and dispatchable via `loadWithQoS:` + `requestWithInputs:`.
+2. Raw `.hwx` Mach-O kernel images, byte-identical to what aned produces, ready for direct kext load via the IOKit `H11ANEIn` user client (`sel=3 ProgramCreate`).
 
-CoreML supports ~26 fixed activation modes. ane-compiler lets you run ANY activation via custom PWL tables:
+The MIL IR path is the practical one — it works under SIP ON, doesn't need kext loads, and handles 14 elementwise op primitives plus all the standard transformer ops (linear, layer_norm, gelu, softmax, matmul, gather). The `.hwx` direct path exists as proof that the compiler matches Apple's binary format.
 
-```python
-from emitter import PWLTable
-import numpy as np
+The `bench_combined_stack.py` measurement (42.2 → 50.2 tok/s on Llama-1B) and the `bench_cross_layer_fusion.py` measurement (40 → 25 dispatches via post-attn + pre-attn fusion) are the experimental evidence that fusion *depth* — not channel-count tuning — is the optimization lever for small models on this hardware.
 
-# Define MISH: f(x) = x * tanh(softplus(x))
-x = np.linspace(-10, 10, 33)
-y = (x * np.tanh(np.log1p(np.exp(x)))).astype(np.float16)
+---
 
-# Build 84-byte PWL table
-header = np.array([-10.0, np.inf, 0.0, np.inf], dtype=np.float16)
-footer = np.array([0.0, 0.0, 1.0, 0.0, 0.0], dtype=np.float16)
-mish_pwl = PWLTable(header=header, breakpoints=y, footer=footer)
+## Hardware constraints (measured)
 
-# Inject into .hwx at offset 0xC000 (replaces default activation)
-# ANE executes MISH — something CoreML cannot produce
-```
+- **93 µs dispatch floor** on M5 Pro (XPC overhead). Below dim 1024, all latency is dispatch-bound, not compute-bound.
+- **dim≈2048 compute crossover** — above this, compute time equals dispatch time.
+- **DMA stride regime change at ic=768** — discrete binary threshold in the compiled `__text` section. Documented in vault notes; not yet measured for latency impact.
+- **128-program slot exclave wall** — the kext refuses to allocate more than 128 program objects per ANE client. Hardware-enforced.
+- **16-tile fixed channel partition** — work is sliced into 16 equal `(ic*oc*2)/16`-byte tile slabs at compile time. Hardware-validated; tile descriptors are cryptographically checked. Not user-tunable.
 
-Verified on hardware: MISH activation on ANE, all 64 channels differ from SiLU baseline.
+---
 
-## Parameterized microcode generation
+## Living Model
 
-No template .hwx needed for standard dimensions:
+`living_model_*.py` is the parked LoRA-during-inference experiment. Three runs measured no overall adaptation headroom (+0%) but the 76% prediction window at tokens 150–175 (vs 55% frozen baseline) showed real signal in early noise — flagged but parked. The Main 26 weight intervention revival (see commit history) opens a different question worth re-examining: now that mid-dispatch DRAM weight modification works through the fresh-`compileWithQoS:` path at ~10 ms/probe, layer-wise ablation studies become tractable.
 
-```python
-from emitter import generate_conv_text, generate_softmax_text, generate_layernorm_text
+---
 
-# Generate __text microcode from dimensions alone
-conv_text = generate_conv_text(in_ch=384, out_ch=768)     # 468 bytes
-sm_text = generate_softmax_text(dim=192, reference_hwx_path="softmax_ref.hwx")
-ln_text = generate_layernorm_text(dim=192, reference_hwx_path="layernorm_ref.hwx")
-```
+## Project Chimera
 
-All byte-identical to Apple's ANE compiler output at novel (never-captured) dimensions.
+`project_chimera_*.py` measured ANE↔GPU handoff cost as **0 µs** (zero, not "small"). Conclusion: handoff is not the bottleneck; GPU Q4 dominates compute at the relevant model sizes. The lesson is that single-accelerator throughput dominates handoff overhead at every interesting model scale. Parked, with the measurement preserved as the reason future split-compute proposals start out skeptical.
 
-## Verification status
+---
 
-| Check | Status | Method |
-|-------|--------|--------|
-| Conv __text parameterization | **PASS** | Byte-identical at 8 dims + kill test 384→768 |
-| Softmax __text parameterization | **PASS** | Byte-identical at 4 dims + kill test dim=192 |
-| LayerNorm __text parameterization | **PASS** | Byte-identical at 4 dims + kill test dim=192 |
-| Weight packing (16-core layout) | **PASS** | Byte-identical at 6 dims incl. non-power-of-2 |
-| Per-op hardware execution | **PASS** | max diff < 1e-3 (conv, softmax, layernorm) |
-| 7-op attention chain | **PASS** | max diff 1.22e-04, 0/64 mismatches > 1e-3 |
-| Full transformer layer (13 dispatches) | **PASS** | Architecturally correct, all ops execute on ANE |
-| Custom MISH activation | **PASS** | 64/64 channels differ from SiLU, PWL injection works |
-| .mlmodelc generation (no coremltools) | **PASS** | Conv/softmax/LN compile on ANE from generated bundles |
+## Related repos
 
-## Limitations
-
-- **Single-op compilation**: ANE daemon compiles one espresso layer per .mlmodelc. Multi-op models fail via `_ANEClient`. Attention is 7 separate dispatches chained via IOSurface.
-- **Per-dispatch overhead**: ~93µs per ANE dispatch. Full transformer layer ≈ 13 × 93µs ≈ 1.2ms. Apple's fused 48-pass .hwx avoids this but requires internal compilation path.
-- **Residual add on CPU**: Two-input elementwise add compiles on ANE but IOSurface reuse across models needs further work. CPU fallback is reliable.
-- **Channel dims must be multiples of 16** for production weight packing.
-- **Softmax/LayerNorm dim=256**: uses different __text template (excluded from parameterization).
-- **No bias support**: conv layers are bias=False only.
-- **FP16 precision**: accumulated error across 13 dispatches can reach ~5e-2 on pathological inputs (near-uniform → layernorm amplifies). Per-op accuracy is < 1e-3.
-- **H17G only** (M1-M5 ANE generation).
-
-## The trade-off
-
-CoreML compiles faster, fuses better (48+ passes in one dispatch), and handles the full model zoo. It's the right choice when you want to deploy a standard model and don't care what happens inside.
-
-ane-compiler is the right choice when you do care. When you need a custom activation. When you need to verify what the hardware is computing. When you're researching the ANE architecture itself. When "it works" isn't enough and you need to know *why* it works — or why it doesn't.
-
-| | ane-compiler | Apple CoreML |
-|---|---|---|
-| **You control** | Weight layout, activation tables, pipeline microcode, dispatch ordering | Model format |
-| **You can see** | Every byte in __text, __KERN_0, load commands, IOSurface routing | A .mlmodelc directory |
-| **Custom activations** | Any 33-breakpoint PWL (MISH, x²/16, yours) | 26 fixed modes |
-| **Multi-op fusion** | No (13 dispatches per transformer layer) | Yes (48+ passes fused) |
-| **Dependencies** | numpy, ane-dispatch | CoreML framework, coremltools |
-| **Best for** | Research, custom ops, ANE understanding | Production deployment |
-
-### vs other ANE projects
-
-| | ane-compiler | [Orion](https://github.com/maderix/orion-ane) | [maderix characterization](https://github.com/maderix) |
-|---|---|---|---|
-| Approach | Binary-level: __text + __KERN_0 + load commands | Direct dispatch (IOKit) | Hardware characterization |
-| Custom activations | Yes (PWL injection) | No | No |
-| Weight layout decoded | Yes (16-core, 32-ch sub-blocks, column-major) | No | No |
-| SharedEvents | Yes (via ane-dispatch) | Listed unexplored | No |
-| Parameterized microcode | Yes (conv, softmax, layernorm) | No | No |
-| Transformer layer | Yes (13-dispatch chain) | No | No |
-| .mlmodelc generation | Yes (no coremltools) | No | No |
-
-We build on insights from both projects. Orion demonstrated direct dispatch was possible. maderix's characterization work mapped the hardware. ane-compiler goes further: decoded the binary format, parameterized the microcode, and proved custom activations work on hardware.
-
-## Related
-
-- [ane-dispatch](https://github.com/MidasMulli/ane-dispatch) — Direct ANE dispatch without CoreML
-- [ane-toolkit](https://github.com/MidasMulli/ane-toolkit) — H17 binary format research + PWL deployment
+- [orion-ane](https://github.com/MidasMulli/orion-ane) — Midas cognitive agent + Subconscious memory system that uses these models
+- [subconscious](https://github.com/MidasMulli/subconscious) — the cognitive memory loops as a separate package
+- [ane-dispatch](https://github.com/MidasMulli/ane-dispatch) — direct ANE dispatch + SharedEvents (37% faster than CoreML)
+- [ane-toolkit](https://github.com/MidasMulli/ane-toolkit) — IOKit protocol decoder + Mach-O `.hwx` tooling
+- [ane-perf](https://github.com/MidasMulli/ane-perf) — ANE hardware performance characterization via IOReport histograms
 
 ## License
 
-MIT
+MIT.

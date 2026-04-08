@@ -126,22 +126,28 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
     """
     import math
 
-    tile_size = in_ch * out_ch * 2 // NUM_ANE_CORES
+    # Tile sizes: first tile gets ceil, rest get floor (handles non-multiple-of-16 out_ch)
+    oc_per_tile_first = -(-out_ch // NUM_ANE_CORES)  # ceil(out_ch / 16)
+    oc_per_tile_rest = out_ch // NUM_ANE_CORES         # floor(out_ch / 16)
+    tile_first = in_ch * oc_per_tile_first * 2
+    tile_rest = in_ch * oc_per_tile_rest * 2
     ic_stride = in_ch * NUM_ANE_CORES  # = in_ch * 16
 
     words = list(_CONV_TEXT_FIXED)
 
-    # W[5]: tile pages — floor for small tiles, ceil for large
-    # tile < 4096: 0 (single page), tile >= 4096: ceil(tile/4096)
-    words[5] = 0 if tile_size < 4096 else (tile_size + 4095) // 4096
+    # W[5]: tile pages (uses original uniform tile_size formula, floor division)
+    tile_size_uniform = in_ch * out_ch * 2 // NUM_ANE_CORES
+    words[5] = 0 if tile_size_uniform < 4096 else tile_size_uniform // 4096
 
-    # W[33]-W[47]: tile offset table (16 entries)
+    # W[33]-W[47]: tile offset table
+    # offset[i] = tile_first + i * tile_rest
     for i in range(16):
-        words[33 + i] = tile_size * (i + 1)
+        words[33 + i] = tile_first + i * tile_rest
 
-    # W[48]-W[63]: tile stride (uniform)
-    for i in range(16):
-        words[48 + i] = tile_size
+    # W[48]-W[63]: tile stride (first tile gets ceil, rest get floor)
+    words[48] = tile_first
+    for i in range(1, 16):
+        words[48 + i] = tile_rest
 
     # W[67]: input channels
     words[67] = in_ch
@@ -161,6 +167,78 @@ def generate_conv_text(in_ch: int, out_ch: int) -> bytes:
     words[87] = ic_stride  # W[87] stays clean
     words[88] = ic_stride  # W[88] stays clean
     words[90] = ic_dma     # W[90] matches W[86]
+
+    return struct.pack(f'<{len(words)}I', *words)
+
+
+def generate_conv_text_int8(in_ch: int, out_ch: int) -> bytes:
+    """Generate INT8 conv1x1 __text microcode from dimensions alone.
+
+    Produces the 117-word (468-byte) ANE pipeline program for an INT8
+    conv1x1 operation. Same structure as FP16 conv with two key changes:
+
+    From system .hwx analysis (VideoProcessing frame enhancers):
+      W[68] = 0x93488005 (INT8 conv opcode, was 0x93418005 FP16)
+      W[71] = 0x5042A0C3 (INT8 dequant config, was out_ch)
+               0x50 = UINT8 kernel format selector
+               0x042A0C3 = dequantization scale/zero-point config
+
+    Tile sizes are computed for INT8 weight density (1 byte/element vs 2).
+    Hardware decompresses INT8 weights to FP16 for computation.
+
+    Args:
+        in_ch: input channels (must be >= 64, multiple of 16)
+        out_ch: output channels (must be >= 64, multiple of 16)
+
+    Returns:
+        468 bytes of __text microcode
+    """
+    import math
+
+    # INT8: 1 byte per weight element (vs 2 for FP16)
+    NC = NUM_ANE_CORES
+    oc_per_tile_first = -(-out_ch // NC)
+    oc_per_tile_rest = out_ch // NC
+    tile_first = in_ch * oc_per_tile_first * 1   # 1 byte per INT8 weight
+    tile_rest = in_ch * oc_per_tile_rest * 1
+    ic_stride = in_ch * NC
+
+    words = list(_CONV_TEXT_FIXED)
+
+    # W[5]: tile pages (INT8 weights = half the size)
+    tile_size_uniform = in_ch * out_ch * 1 // NC
+    words[5] = 0 if tile_size_uniform < 4096 else tile_size_uniform // 4096
+
+    # W[33]-W[47]: tile offset table (INT8 density)
+    for i in range(16):
+        words[33 + i] = tile_first + i * tile_rest
+
+    # W[48]-W[63]: tile stride (INT8 density)
+    words[48] = tile_first
+    for i in range(1, 16):
+        words[48 + i] = tile_rest
+
+    # W[67]: input channels (unchanged)
+    words[67] = in_ch
+
+    # W[68]: INT8 conv opcode (key change #1)
+    words[68] = 0x93488005
+
+    # W[71]: INT8 dequant config word (key change #2 — replaces out_ch)
+    words[71] = 0x5042A0C3
+
+    # W[73]: pipeline config
+    words[73] = 0x200004 if in_ch <= 640 else 0x244404
+
+    # W[74]: pipeline depth
+    words[74] = min(math.ceil(math.log2(out_ch / 16)), 5)
+
+    # W[86,87,88,90]: input DMA stride
+    ic_dma = ic_stride if in_ch <= 640 else ic_stride + 0x30
+    words[86] = ic_dma
+    words[87] = ic_stride
+    words[88] = ic_stride
+    words[90] = ic_dma
 
     return struct.pack(f'<{len(words)}I', *words)
 
@@ -538,6 +616,41 @@ class LayerNormParams:
         return struct.pack('<f', self.epsilon)
 
 
+@dataclass
+class BatchNormParams:
+    """Parameters for batchnorm emission (affine scale+bias for LayerNorm).
+
+    Batchnorm with mean=0, variance=1, epsilon=0 implements:
+        output = gamma * input + beta
+
+    ANE batchnorm at dim=768 compiles to a single dispatch:
+      - __text: 320B (80 words), opcode 0x9D41
+      - __const: 3072B = [beta/gamma (768 FP16), gamma (768 FP16)]
+
+    Hardware computes: output = gamma * (input + beta/gamma)
+    This is mathematically equivalent to gamma*input + beta but uses
+    a single fused multiply-add per element.
+
+    Used after MVN dispatch to implement LayerNorm with elementwise_affine=True.
+    """
+    gamma: np.ndarray   # Per-channel scale [dim] (FP32)
+    beta: np.ndarray    # Per-channel bias [dim] (FP32)
+
+    @property
+    def dim(self) -> int:
+        return len(self.gamma)
+
+    def pack_const(self) -> bytes:
+        """Pack gamma/beta into ANE batchnorm __const format.
+
+        Layout: [beta/gamma (dim FP16), gamma (dim FP16)]
+        Total: dim * 4 bytes
+        """
+        ratio = (self.beta / self.gamma).astype(np.float16)
+        gamma_fp16 = self.gamma.astype(np.float16)
+        return ratio.tobytes() + gamma_fp16.tobytes()
+
+
 # ═══════════════════════════════════════════════════════════════
 # Template registry
 # ═══════════════════════════════════════════════════════════════
@@ -654,6 +767,9 @@ class HWXTemplate:
             elif self.text_size > 400 and self.file_size == 49152:
                 # 4-pass layernorm: large __text, no __KERN_0, 48K file
                 self.template_class = "layernorm"
+            elif self.text_size == 320 and self.kern0_offset == 0 and self.const_size > 0:
+                # Batchnorm: 320B __text, no __KERN_0, has __const
+                self.template_class = "batchnorm"
             elif self.file_size == 65536:
                 self.template_class = "64k_activation"
             else:
@@ -675,6 +791,7 @@ class TemplateRegistry:
         self._conv: Dict[str, HWXTemplate] = {}
         self._softmax: Dict[str, HWXTemplate] = {}
         self._layernorm: Dict[str, HWXTemplate] = {}
+        self._batchnorm: Dict[str, HWXTemplate] = {}
 
     def load_directory(self, path: str):
         """Load all .hwx files from a directory as templates."""
@@ -704,6 +821,8 @@ class TemplateRegistry:
             self._softmax[t.name] = t
         elif t.template_class == 'layernorm':
             self._layernorm[t.name] = t
+        elif t.template_class == 'batchnorm':
+            self._batchnorm[t.name] = t
 
     def get_activation_template(self, activation: ActivationType) -> HWXTemplate:
         """Get the best template for an activation function."""
@@ -759,6 +878,17 @@ class TemplateRegistry:
         raise ValueError("No layernorm template available. "
                         "Load a layernorm .hwx (e.g. from attention_probe_v3/)")
 
+    def get_batchnorm_template(self) -> HWXTemplate:
+        """Get a batchnorm template (single-pass scale+bias).
+
+        Batchnorm is used for LayerNorm affine params (gamma*x + beta).
+        Template: 320B __text + 3072B __const at dim=768.
+        """
+        if self._batchnorm:
+            return next(iter(self._batchnorm.values()))
+        raise ValueError("No batchnorm template available. "
+                        "Load a batchnorm .hwx captured from aned.")
+
 
 # ═══════════════════════════════════════════════════════════════
 # Weight packer
@@ -788,16 +918,17 @@ class WeightPacker:
     def pack_conv1x1(weights: np.ndarray) -> bytes:
         """Pack conv1x1 weights into ANE __KERN_0 layout.
 
-        The ANE uses a 16-core tiled layout with 32-channel sub-blocks:
-          block = out_ch // 16  (output channels per core)
-          sub1 = min(32, block)  (first sub-block size)
-          sub2 = block - sub1    (second sub-block, 0 if block ≤ 32)
+        The ANE uses a 16-core tiled layout with 32-channel sub-blocks
+        organized in "stripes" across tiles.
 
-        For block ≤ 32 (out_ch ≤ 512): single sub-block per tile, column-major.
-        For block > 32 (out_ch > 512): two sub-blocks (32 + remainder) per tile.
+        Layout: rows are assigned to tiles in 32-row stripes.
+        Stripe s contains rows [s*512 : (s+1)*512], distributed as
+        32 consecutive rows per tile. A remainder stripe at the end
+        handles non-multiple-of-32 tile sizes, with tile 0 getting
+        ceil and tiles 1-15 getting floor of the remainder.
 
         Verified byte-identical to Apple's ANE compiler at:
-        64→64, 64→128, 128→256, 256→512, 384→768, 512→1024.
+        768x768, 768x3072, 3072x768, 768x50257 (all GPT-2 dims).
 
         Args:
             weights: [out_channels, in_channels] weight matrix
@@ -805,26 +936,42 @@ class WeightPacker:
         Returns:
             Packed bytes for __KERN_0 section
         """
+        NC = WeightPacker.NUM_CORES
         w = weights.astype(np.float16)
         out_ch, in_ch = w.shape
 
-        if out_ch < WeightPacker.NUM_CORES or out_ch % WeightPacker.NUM_CORES != 0:
+        if out_ch < NC:
             return w.flatten().tobytes()
 
-        block = out_ch // WeightPacker.NUM_CORES
-        sub1 = min(32, block)
-        sub2 = block - sub1
-        split_point = WeightPacker.NUM_CORES * sub1
+        sub_size = 32
+        stripe_size = NC * sub_size  # 512
+
+        # Per-tile output channel counts (tile 0 gets ceil, rest floor)
+        oc_first = -(-out_ch // NC)   # ceil
+        oc_rest = out_ch // NC         # floor
+
+        # Full stripes (all tiles get 32 rows each)
+        n_full = oc_rest // sub_size
+        # Remainder per tile after full stripes
+        rem_first = oc_first - n_full * sub_size
+        rem_rest = oc_rest - n_full * sub_size
 
         result = []
-        for t in range(WeightPacker.NUM_CORES):
-            # First sub-block: column-major (Fortran order)
-            first = w[t * sub1:(t + 1) * sub1, :]
-            result.append(first.flatten(order='F'))
-            # Second sub-block (if block > 32)
-            if sub2 > 0:
-                second = w[split_point + t * sub2:split_point + (t + 1) * sub2, :]
-                result.append(second.flatten(order='F'))
+        for t in range(NC):
+            # Full 32-row sub-blocks from each stripe
+            for s in range(n_full):
+                row_start = t * sub_size + s * stripe_size
+                result.append(w[row_start:row_start + sub_size, :].flatten(order='F'))
+
+            # Remainder sub-block from partial stripe
+            rem = rem_first if t == 0 else rem_rest
+            if rem > 0:
+                rem_stripe_start = n_full * stripe_size
+                if t == 0:
+                    row_start = rem_stripe_start
+                else:
+                    row_start = rem_stripe_start + rem_first + (t - 1) * rem_rest
+                result.append(w[row_start:row_start + rem, :].flatten(order='F'))
 
         return np.concatenate(result).tobytes()
 
@@ -862,9 +1009,86 @@ class WeightPacker:
         return w
 
     @staticmethod
+    def pack_conv1x1_int8(weights: np.ndarray,
+                          scale: Optional[np.ndarray] = None,
+                          zero_point: Optional[np.ndarray] = None
+                          ) -> Tuple[bytes, np.ndarray, np.ndarray]:
+        """Pack conv1x1 weights as INT8 into ANE __KERN_0 layout.
+
+        Quantizes FP16/FP32 weights to UINT8 using per-channel symmetric
+        quantization (matching Apple's INT8 format), then packs in the
+        same 16-core tiled layout as FP16 but at 1 byte per element.
+
+        The ANE hardware decompresses INT8 to FP16 for computation using
+        the dequant config encoded in __text W[71] = 0x5042A0C3.
+
+        Args:
+            weights: [out_channels, in_channels] weight matrix (FP32 or FP16)
+            scale: optional per-channel scale [out_channels] (computed if None)
+            zero_point: optional per-channel zero point [out_channels] (computed if None)
+
+        Returns:
+            Tuple of (packed_bytes, scale, zero_point) where:
+              packed_bytes: INT8 packed weights for __KERN_0
+              scale: per-channel dequant scale [out_channels]
+              zero_point: per-channel zero point [out_channels]
+        """
+        NC = WeightPacker.NUM_CORES
+        w = weights.astype(np.float32)
+        out_ch, in_ch = w.shape
+
+        # Per-channel symmetric quantization
+        if scale is None or zero_point is None:
+            w_min = w.min(axis=1)
+            w_max = w.max(axis=1)
+            scale = (w_max - w_min) / 255.0
+            scale = np.where(scale == 0, 1.0, scale)  # avoid div by zero
+            zero_point = np.round(-w_min / scale).astype(np.uint8)
+
+        # Quantize to UINT8
+        w_int8 = np.clip(np.round(w / scale[:, None] + zero_point[:, None].astype(np.float32)),
+                         0, 255).astype(np.uint8)
+
+        if out_ch < NC:
+            return w_int8.flatten().tobytes(), scale, zero_point
+
+        sub_size = 32
+        stripe_size = NC * sub_size
+
+        oc_first = -(-out_ch // NC)
+        oc_rest = out_ch // NC
+        n_full = oc_rest // sub_size
+        rem_first = oc_first - n_full * sub_size
+        rem_rest = oc_rest - n_full * sub_size
+
+        result = []
+        for t in range(NC):
+            for s in range(n_full):
+                row_start = t * sub_size + s * stripe_size
+                # Column-major packing (same as FP16 but 1 byte/element)
+                result.append(w_int8[row_start:row_start + sub_size, :].flatten(order='F'))
+
+            rem = rem_first if t == 0 else rem_rest
+            if rem > 0:
+                rem_stripe_start = n_full * stripe_size
+                if t == 0:
+                    row_start = rem_stripe_start
+                else:
+                    row_start = rem_stripe_start + rem_first + (t - 1) * rem_rest
+                result.append(w_int8[row_start:row_start + rem, :].flatten(order='F'))
+
+        packed = np.concatenate(result).tobytes()
+        return packed, scale.astype(np.float32), zero_point.astype(np.uint8)
+
+    @staticmethod
     def compute_kern0_size(out_ch: int, in_ch: int) -> int:
         """Compute the __KERN_0 section size needed for given dimensions."""
         return out_ch * in_ch * 2  # FP16
+
+    @staticmethod
+    def compute_kern0_size_int8(out_ch: int, in_ch: int) -> int:
+        """Compute the __KERN_0 section size for INT8 weights."""
+        return out_ch * in_ch  # 1 byte per element
 
     @staticmethod
     def pack_into_template(template_kern0: bytes, weights: np.ndarray,
@@ -906,6 +1130,353 @@ class WeightPacker:
                 buf[tile_start:tile_start + len(pwl_bytes)] = pwl_bytes
 
         return bytes(buf)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Full .hwx emission from template (no aned required)
+# ═══════════════════════════════════════════════════════════════
+
+def _round_up(x: int, alignment: int) -> int:
+    return (x + alignment - 1) & ~(alignment - 1)
+
+
+def emit_linear_hwx(template_hwx: bytes, in_ch: int, out_ch: int,
+                     weights: np.ndarray) -> bytes:
+    """Emit a complete .hwx for a linear projection (inner_product/conv1x1).
+
+    Takes a captured reference .hwx as structural template and patches
+    all dimension-dependent fields. Generates __text from scratch via
+    generate_conv_text(). Packs weights via WeightPacker.pack_conv1x1().
+
+    The template must be a valid inner_product .hwx captured from aned.
+    Any dimension works — all dimension-dependent fields are patched.
+
+    Args:
+        template_hwx: bytes of a reference .hwx (any inner_product/conv)
+        in_ch: input channels
+        out_ch: output channels
+        weights: [out_ch, in_ch] weight matrix (FP32 or FP16)
+
+    Returns:
+        Complete .hwx bytes ready for ANE dispatch
+    """
+    PAGE = 0x4000
+
+    # Compute layout
+    fvmlib0_vmsize = _round_up(in_ch * 64, PAGE)
+    fvmlib1_vmsize = _round_up(out_ch * 64, PAGE)
+    text_vmaddr = 0x30000000 + fvmlib0_vmsize + fvmlib1_vmsize
+    kern0_vmaddr = text_vmaddr + 0x8000
+    fvmlib1_vmaddr = 0x30000000 + fvmlib0_vmsize
+
+    weight_data = WeightPacker.pack_conv1x1(weights.reshape(out_ch, in_ch))
+    kern0_filesize = _round_up(len(weight_data), PAGE)
+    total_filesize = 0xC000 + kern0_filesize
+
+    # Build output buffer from template
+    buf = bytearray(total_filesize)
+    copy_len = min(len(template_hwx), total_filesize)
+    buf[:copy_len] = template_hwx[:copy_len]
+
+    # --- Extract template's original vmaddrs for replacement ---
+    ncmds = struct.unpack_from('<I', template_hwx, 0x10)[0]
+    tmpl_text_va = tmpl_fv1_va = tmpl_kern0_va = 0
+    tmpl_in_ch = tmpl_out_ch = 0
+    fv_idx = 0
+    off = 32
+    seg_lc = []
+    thread_lc = []
+    for _ in range(ncmds):
+        cmd = struct.unpack_from('<I', template_hwx, off)[0]
+        cs = struct.unpack_from('<I', template_hwx, off + 4)[0]
+        if cmd == 0x19:
+            sn = bytes(template_hwx[off+8:off+24]).split(b'\x00')[0].decode('ascii')
+            va = struct.unpack_from('<Q', template_hwx, off + 24)[0]
+            vs = struct.unpack_from('<Q', template_hwx, off + 32)[0]
+            seg_lc.append((off, cs, sn, va, vs))
+            if sn == '__FVMLIB':
+                if fv_idx == 0:
+                    tmpl_in_ch = vs // 64
+                elif fv_idx == 1:
+                    tmpl_fv1_va = va
+                    tmpl_out_ch = vs // 64
+                fv_idx += 1
+            elif sn == '__TEXT':
+                tmpl_text_va = va
+            elif sn == '__KERN_0':
+                tmpl_kern0_va = va
+        elif cmd == 0x04:
+            thread_lc.append((off, cs))
+        off += cs
+
+    # --- Patch LC_SEGMENT_64 ---
+    fv_idx = 0
+    for seg_off, seg_cs, sn, old_va, old_vs in seg_lc:
+        if sn == '__FVMLIB':
+            if fv_idx == 0:
+                struct.pack_into('<Q', buf, seg_off + 24, 0x30000000)
+                struct.pack_into('<Q', buf, seg_off + 32, fvmlib0_vmsize)
+                ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+                if ns > 0:
+                    struct.pack_into('<Q', buf, seg_off + 72 + 32, 0x30000000)
+                    struct.pack_into('<Q', buf, seg_off + 72 + 40, in_ch * 64)
+            else:
+                struct.pack_into('<Q', buf, seg_off + 24, fvmlib1_vmaddr)
+                struct.pack_into('<Q', buf, seg_off + 32, fvmlib1_vmsize)
+                ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+                if ns > 0:
+                    struct.pack_into('<Q', buf, seg_off + 72 + 32, fvmlib1_vmaddr)
+                    struct.pack_into('<Q', buf, seg_off + 72 + 40, out_ch * 64)
+            fv_idx += 1
+        elif sn == '__TEXT':
+            struct.pack_into('<Q', buf, seg_off + 24, text_vmaddr)
+            for s in range(struct.unpack_from('<I', buf, seg_off + 64)[0]):
+                s_base = seg_off + 72 + s * 80
+                sname = bytes(buf[s_base:s_base+16]).split(b'\x00')[0].decode('ascii')
+                if sname == '__text':
+                    struct.pack_into('<Q', buf, s_base + 32, text_vmaddr)
+                elif sname == '__const':
+                    struct.pack_into('<Q', buf, s_base + 32, text_vmaddr + 0x200)
+        elif sn == '__KERN_0':
+            struct.pack_into('<Q', buf, seg_off + 24, kern0_vmaddr)
+            struct.pack_into('<Q', buf, seg_off + 32, kern0_filesize)
+            struct.pack_into('<Q', buf, seg_off + 48, kern0_filesize)
+            ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+            if ns > 0:
+                struct.pack_into('<Q', buf, seg_off + 72 + 32, kern0_vmaddr)
+                struct.pack_into('<Q', buf, seg_off + 72 + 40, len(weight_data))
+        elif sn == '__LINKEDIT':
+            struct.pack_into('<Q', buf, seg_off + 24, kern0_vmaddr + kern0_filesize)
+
+    # --- Patch LC_THREAD commands ---
+    if len(thread_lc) >= 3:
+        # Thread #0: replace vmaddr references
+        t0_off, t0_cs = thread_lc[0]
+        nw = (t0_cs - 8) // 4
+        words = list(struct.unpack(f'<{nw}I', buf[t0_off+8:t0_off+t0_cs]))
+        tile_size = in_ch * out_ch * 2 // NUM_ANE_CORES
+        tile_pages = 0 if tile_size < 4096 else (tile_size + 4095) // 4096
+        tmpl_tile = (tmpl_in_ch * tmpl_out_ch * 2 // NUM_ANE_CORES + 4095) // 4096
+
+        for i in range(nw):
+            v = words[i]
+            if v == tmpl_text_va:
+                words[i] = text_vmaddr
+            elif v == tmpl_text_va + 0x200:
+                words[i] = text_vmaddr + 0x200
+            elif v == tmpl_fv1_va:
+                words[i] = fvmlib1_vmaddr
+            elif v == tmpl_kern0_va:
+                words[i] = kern0_vmaddr
+            elif v == tmpl_tile and tmpl_tile > 0:
+                words[i] = tile_pages
+        struct.pack_into(f'<{nw}I', buf, t0_off + 8, *words)
+
+        # Thread #1: input descriptor
+        t1_off, t1_cs = thread_lc[1]
+        nw1 = (t1_cs - 8) // 4
+        tmpl_w1 = struct.unpack(f'<{nw1}I', template_hwx[t1_off+8:t1_off+t1_cs])
+        words1 = list(struct.unpack(f'<{nw1}I', buf[t1_off+8:t1_off+t1_cs]))
+        for i in range(nw1):
+            if tmpl_w1[i] == tmpl_in_ch:
+                words1[i] = in_ch
+            elif tmpl_w1[i] == tmpl_in_ch * 64:
+                words1[i] = in_ch * 64
+        struct.pack_into(f'<{nw1}I', buf, t1_off + 8, *words1)
+
+        # Thread #2: output descriptor
+        t2_off, t2_cs = thread_lc[2]
+        nw2 = (t2_cs - 8) // 4
+        tmpl_w2 = struct.unpack(f'<{nw2}I', template_hwx[t2_off+8:t2_off+t2_cs])
+        words2 = list(struct.unpack(f'<{nw2}I', buf[t2_off+8:t2_off+t2_cs]))
+        for i in range(nw2):
+            if tmpl_w2[i] == tmpl_out_ch:
+                words2[i] = out_ch
+            elif tmpl_w2[i] == tmpl_out_ch * 64:
+                words2[i] = out_ch * 64
+        struct.pack_into(f'<{nw2}I', buf, t2_off + 8, *words2)
+
+    # --- Write __text (from scratch) ---
+    text = generate_conv_text(in_ch, out_ch)
+    buf[0x4000:0x4000 + len(text)] = text
+
+    # --- Write weights ---
+    buf[0xC000:0xC000 + len(weight_data)] = weight_data
+
+    return bytes(buf)
+
+
+def emit_linear_hwx_int8(template_hwx: bytes, in_ch: int, out_ch: int,
+                          weights: np.ndarray) -> Tuple[bytes, np.ndarray, np.ndarray]:
+    """Emit a complete .hwx for an INT8 linear projection.
+
+    Same structure as emit_linear_hwx() but with INT8 quantization:
+    - __text uses opcode 0x9348 (INT8 conv) instead of 0x9341 (FP16 conv)
+    - W[71] = 0x5042A0C3 (INT8 dequant config) instead of out_ch
+    - __KERN_0 stores INT8 weights at half the FP16 size
+    - Tile sizes adjusted for 1 byte/element density
+
+    The ANE hardware decompresses INT8 to FP16 for computation.
+    Prior measurement: INT8 has zero compute speedup (1.005x = noise).
+    Benefit is DMA bandwidth: 2x fewer bytes transferred per dispatch.
+
+    Args:
+        template_hwx: bytes of a reference .hwx (any inner_product/conv)
+        in_ch: input channels
+        out_ch: output channels
+        weights: [out_ch, in_ch] weight matrix (FP32 or FP16)
+
+    Returns:
+        Tuple of (hwx_bytes, scale, zero_point) where:
+          hwx_bytes: complete .hwx ready for ANE dispatch
+          scale: per-channel dequant scale [out_channels]
+          zero_point: per-channel zero point [out_channels]
+    """
+    PAGE = 0x4000
+
+    # Compute layout (same FVMLIB sizes as FP16 — IO is always FP16)
+    fvmlib0_vmsize = _round_up(in_ch * 64, PAGE)
+    fvmlib1_vmsize = _round_up(out_ch * 64, PAGE)
+    text_vmaddr = 0x30000000 + fvmlib0_vmsize + fvmlib1_vmsize
+    kern0_vmaddr = text_vmaddr + 0x8000
+    fvmlib1_vmaddr = 0x30000000 + fvmlib0_vmsize
+
+    # INT8 weights: half the size
+    weight_data, scale, zero_point = WeightPacker.pack_conv1x1_int8(
+        weights.reshape(out_ch, in_ch))
+    kern0_filesize = _round_up(len(weight_data), PAGE)
+    total_filesize = 0xC000 + kern0_filesize
+
+    # Build output buffer from template
+    buf = bytearray(total_filesize)
+    copy_len = min(len(template_hwx), total_filesize)
+    buf[:copy_len] = template_hwx[:copy_len]
+
+    # --- Extract template's original vmaddrs for replacement ---
+    ncmds = struct.unpack_from('<I', template_hwx, 0x10)[0]
+    tmpl_text_va = tmpl_fv1_va = tmpl_kern0_va = 0
+    tmpl_in_ch = tmpl_out_ch = 0
+    fv_idx = 0
+    off = 32
+    seg_lc = []
+    thread_lc = []
+    for _ in range(ncmds):
+        cmd = struct.unpack_from('<I', template_hwx, off)[0]
+        cs = struct.unpack_from('<I', template_hwx, off + 4)[0]
+        if cmd == 0x19:
+            sn = bytes(template_hwx[off+8:off+24]).split(b'\x00')[0].decode('ascii')
+            va = struct.unpack_from('<Q', template_hwx, off + 24)[0]
+            vs = struct.unpack_from('<Q', template_hwx, off + 32)[0]
+            seg_lc.append((off, cs, sn, va, vs))
+            if sn == '__FVMLIB':
+                if fv_idx == 0:
+                    tmpl_in_ch = vs // 64
+                elif fv_idx == 1:
+                    tmpl_fv1_va = va
+                    tmpl_out_ch = vs // 64
+                fv_idx += 1
+            elif sn == '__TEXT':
+                tmpl_text_va = va
+            elif sn == '__KERN_0':
+                tmpl_kern0_va = va
+        elif cmd == 0x04:
+            thread_lc.append((off, cs))
+        off += cs
+
+    # --- Patch LC_SEGMENT_64 ---
+    fv_idx = 0
+    for seg_off, seg_cs, sn, old_va, old_vs in seg_lc:
+        if sn == '__FVMLIB':
+            if fv_idx == 0:
+                struct.pack_into('<Q', buf, seg_off + 24, 0x30000000)
+                struct.pack_into('<Q', buf, seg_off + 32, fvmlib0_vmsize)
+                ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+                if ns > 0:
+                    struct.pack_into('<Q', buf, seg_off + 72 + 32, 0x30000000)
+                    struct.pack_into('<Q', buf, seg_off + 72 + 40, in_ch * 64)
+            else:
+                struct.pack_into('<Q', buf, seg_off + 24, fvmlib1_vmaddr)
+                struct.pack_into('<Q', buf, seg_off + 32, fvmlib1_vmsize)
+                ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+                if ns > 0:
+                    struct.pack_into('<Q', buf, seg_off + 72 + 32, fvmlib1_vmaddr)
+                    struct.pack_into('<Q', buf, seg_off + 72 + 40, out_ch * 64)
+            fv_idx += 1
+        elif sn == '__TEXT':
+            struct.pack_into('<Q', buf, seg_off + 24, text_vmaddr)
+            for s in range(struct.unpack_from('<I', buf, seg_off + 64)[0]):
+                s_base = seg_off + 72 + s * 80
+                sname = bytes(buf[s_base:s_base+16]).split(b'\x00')[0].decode('ascii')
+                if sname == '__text':
+                    struct.pack_into('<Q', buf, s_base + 32, text_vmaddr)
+                elif sname == '__const':
+                    struct.pack_into('<Q', buf, s_base + 32, text_vmaddr + 0x200)
+        elif sn == '__KERN_0':
+            struct.pack_into('<Q', buf, seg_off + 24, kern0_vmaddr)
+            struct.pack_into('<Q', buf, seg_off + 32, kern0_filesize)
+            struct.pack_into('<Q', buf, seg_off + 48, kern0_filesize)
+            ns = struct.unpack_from('<I', buf, seg_off + 64)[0]
+            if ns > 0:
+                struct.pack_into('<Q', buf, seg_off + 72 + 32, kern0_vmaddr)
+                struct.pack_into('<Q', buf, seg_off + 72 + 40, len(weight_data))
+        elif sn == '__LINKEDIT':
+            struct.pack_into('<Q', buf, seg_off + 24, kern0_vmaddr + kern0_filesize)
+
+    # --- Patch LC_THREAD commands ---
+    if len(thread_lc) >= 3:
+        t0_off, t0_cs = thread_lc[0]
+        nw = (t0_cs - 8) // 4
+        words = list(struct.unpack(f'<{nw}I', buf[t0_off+8:t0_off+t0_cs]))
+        tile_size = in_ch * out_ch * 1 // NUM_ANE_CORES  # INT8: 1 byte/element
+        tile_pages = 0 if tile_size < 4096 else (tile_size + 4095) // 4096
+        tmpl_tile = (tmpl_in_ch * tmpl_out_ch * 2 // NUM_ANE_CORES + 4095) // 4096
+
+        for i in range(nw):
+            v = words[i]
+            if v == tmpl_text_va:
+                words[i] = text_vmaddr
+            elif v == tmpl_text_va + 0x200:
+                words[i] = text_vmaddr + 0x200
+            elif v == tmpl_fv1_va:
+                words[i] = fvmlib1_vmaddr
+            elif v == tmpl_kern0_va:
+                words[i] = kern0_vmaddr
+            elif v == tmpl_tile and tmpl_tile > 0:
+                words[i] = tile_pages
+        struct.pack_into(f'<{nw}I', buf, t0_off + 8, *words)
+
+        # Thread #1: input descriptor
+        t1_off, t1_cs = thread_lc[1]
+        nw1 = (t1_cs - 8) // 4
+        tmpl_w1 = struct.unpack(f'<{nw1}I', template_hwx[t1_off+8:t1_off+t1_cs])
+        words1 = list(struct.unpack(f'<{nw1}I', buf[t1_off+8:t1_off+t1_cs]))
+        for i in range(nw1):
+            if tmpl_w1[i] == tmpl_in_ch:
+                words1[i] = in_ch
+            elif tmpl_w1[i] == tmpl_in_ch * 64:
+                words1[i] = in_ch * 64
+        struct.pack_into(f'<{nw1}I', buf, t1_off + 8, *words1)
+
+        # Thread #2: output descriptor
+        t2_off, t2_cs = thread_lc[2]
+        nw2 = (t2_cs - 8) // 4
+        tmpl_w2 = struct.unpack(f'<{nw2}I', template_hwx[t2_off+8:t2_off+t2_cs])
+        words2 = list(struct.unpack(f'<{nw2}I', buf[t2_off+8:t2_off+t2_cs]))
+        for i in range(nw2):
+            if tmpl_w2[i] == tmpl_out_ch:
+                words2[i] = out_ch
+            elif tmpl_w2[i] == tmpl_out_ch * 64:
+                words2[i] = out_ch * 64
+        struct.pack_into(f'<{nw2}I', buf, t2_off + 8, *words2)
+
+    # --- Write INT8 __text (from scratch) ---
+    text = generate_conv_text_int8(in_ch, out_ch)
+    buf[0x4000:0x4000 + len(text)] = text
+
+    # --- Write INT8 weights ---
+    buf[0xC000:0xC000 + len(weight_data)] = weight_data
+
+    return bytes(buf), scale, zero_point
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1174,6 +1745,101 @@ class ANECompiler:
             writer.write(output_path)
         return result
 
+    def emit_batchnorm(self, params: BatchNormParams,
+                       output_path: Optional[str] = None) -> bytes:
+        """Emit a batchnorm .hwx (single-pass scale+bias).
+
+        Implements: output = gamma * input + beta
+
+        Used after MVN dispatch to add learned affine parameters to LayerNorm.
+        Template-based: replaces __const data with packed gamma/beta.
+
+        The batchnorm template has:
+          - __text: 320B (80 words), opcode 0x9D41 (multi-pass with const data)
+          - __const: dim*4 bytes = [beta/gamma (FP16), gamma (FP16)]
+
+        Args:
+            params: BatchNormParams with gamma and beta arrays
+            output_path: optional path to write .hwx
+
+        Returns:
+            Complete .hwx bytes ready for ANE dispatch
+        """
+        template = self.registry.get_batchnorm_template()
+        writer = HWXWriter(template)
+
+        # Pack gamma/beta into __const format
+        const_data = params.pack_const()
+
+        # Find __const offset and size in the template
+        # __const starts at text_offset + text_size (rounded up to alignment)
+        ncmds = struct.unpack_from('<I', template.data, 0x10)[0]
+        offset = 32
+        const_off = 0
+        for _ in range(ncmds):
+            cmd = struct.unpack_from('<I', template.data, offset)[0]
+            cmdsize = struct.unpack_from('<I', template.data, offset + 4)[0]
+            if cmd == 0x19:  # LC_SEGMENT_64
+                segname = template.data[offset+8:offset+24].split(b'\x00')[0].decode('ascii')
+                nsects = struct.unpack_from('<I', template.data, offset+64)[0]
+                for s in range(nsects):
+                    s_off = offset + 72 + s * 80
+                    sectname = template.data[s_off:s_off+16].split(b'\x00')[0].decode('ascii')
+                    sect_foff = struct.unpack_from('<I', template.data, s_off+48)[0]
+                    if segname == '__TEXT' and sectname == '__const':
+                        const_off = sect_foff
+            offset += cmdsize
+
+        if const_off == 0:
+            raise ValueError("Batchnorm template has no __const section")
+
+        # Write packed gamma/beta to __const
+        writer.output[const_off:const_off + len(const_data)] = const_data
+
+        result = writer.build()
+        if output_path:
+            Path(output_path).write_bytes(result)
+        return result
+
+    def emit_layernorm_affine(self, gamma: np.ndarray, beta: np.ndarray,
+                              epsilon: float = 1e-5,
+                              output_path: Optional[str] = None) -> Tuple[bytes, bytes]:
+        """Emit LayerNorm with learned affine parameters as two .hwx files.
+
+        Implements: output = gamma * LayerNorm(input, eps) + beta
+
+        Returns two .hwx files:
+          1. MVN .hwx (mean-variance normalization)
+          2. Batchnorm .hwx (gamma * x + beta)
+
+        Chain them via ane-dispatch IOSurface routing.
+
+        Args:
+            gamma: per-channel scale [dim] (FP32)
+            beta: per-channel bias [dim] (FP32)
+            epsilon: LayerNorm epsilon
+            output_path: base path (writes .mvn.hwx and .affine.hwx)
+
+        Returns:
+            Tuple (mvn_hwx_bytes, affine_hwx_bytes)
+        """
+        dim = len(gamma)
+
+        # 1. MVN .hwx
+        ln_params = LayerNormParams(epsilon=epsilon, dim=dim)
+        mvn_hwx = self.emit_layernorm(params=ln_params)
+
+        # 2. Batchnorm .hwx (affine: gamma*x + beta)
+        bn_params = BatchNormParams(gamma=gamma, beta=beta)
+        affine_hwx = self.emit_batchnorm(params=bn_params)
+
+        if output_path:
+            base = Path(output_path)
+            base.with_suffix('.mvn.hwx').write_bytes(mvn_hwx)
+            base.with_suffix('.affine.hwx').write_bytes(affine_hwx)
+
+        return mvn_hwx, affine_hwx
+
     def emit_ffn(self, weights_gate: np.ndarray, weights_down: np.ndarray,
                  activation: ActivationType = ActivationType.SILU,
                  activation_pwl: Optional[PWLTable] = None,
@@ -1255,6 +1921,17 @@ if __name__ == '__main__':
     conv_p.add_argument('--activation', default='relu',
                        choices=[a.value for a in ActivationType])
 
+    # Batchnorm mode (for LN affine params)
+    bn_p = sub.add_parser('batchnorm', help='Emit batchnorm (scale+bias)')
+    bn_p.add_argument('--gamma', required=True, help='Gamma weights .npy')
+    bn_p.add_argument('--beta', required=True, help='Beta weights .npy')
+
+    # LayerNorm+affine mode (MVN + batchnorm)
+    lna_p = sub.add_parser('layernorm-affine', help='Emit layernorm with affine (MVN + batchnorm)')
+    lna_p.add_argument('--gamma', required=True, help='Gamma weights .npy')
+    lna_p.add_argument('--beta', required=True, help='Beta weights .npy')
+    lna_p.add_argument('--epsilon', type=float, default=1e-5)
+
     # FFN mode
     ffn_p = sub.add_parser('ffn', help='Emit FFN (gate+activation + down)')
     ffn_p.add_argument('--gate-weights', required=True, help='Gate weights .npy')
@@ -1303,6 +1980,21 @@ if __name__ == '__main__':
         act = ActivationType(args.activation)
         hwx = compiler.emit_conv_activation(w, act, output_path=args.output)
         print(f"Emitted conv+{act.value}: {len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'batchnorm':
+        gamma = np.load(args.gamma)
+        beta = np.load(args.beta)
+        params = BatchNormParams(gamma=gamma, beta=beta)
+        hwx = compiler.emit_batchnorm(params, output_path=args.output)
+        print(f"Emitted batchnorm (dim={len(gamma)}): {len(hwx)} bytes → {args.output}")
+
+    elif args.mode == 'layernorm-affine':
+        gamma = np.load(args.gamma)
+        beta = np.load(args.beta)
+        mvn_hwx, affine_hwx = compiler.emit_layernorm_affine(
+            gamma, beta, epsilon=args.epsilon, output_path=args.output)
+        print(f"Emitted layernorm+affine (dim={len(gamma)}, eps={args.epsilon}): "
+              f"mvn={len(mvn_hwx)}B, affine={len(affine_hwx)}B → {args.output}")
 
     elif args.mode == 'ffn':
         gate_w = np.load(args.gate_weights)
