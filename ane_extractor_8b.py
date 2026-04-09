@@ -154,19 +154,47 @@ class ANEExtractor8B:
         self.tokenizer = AutoTokenizer.from_pretrained(
             'unsloth/Meta-Llama-3.1-8B-Instruct')
 
-        # CoreML models
+        # CoreML models. Recovery patch (Main 35 close): the source
+        # .mlpackage weights at BUILD_DIR can disappear from /tmp under
+        # macOS periodic cleanup. CoreML's compiled .mlmodelc artifacts
+        # in the per-user temp dir under /var/folders survive across
+        # restarts and are valid model paths in their own right. Try the
+        # compiled cache first, fall back to .mlpackage source.
+        import tempfile
+        coreml_cache = tempfile.gettempdir()  # /var/folders/.../T/
+
+        def _load_one(name, prefer_compiled=True):
+            compiled = f'{coreml_cache}/{name}.mlmodelc'
+            source = f'{self.build_dir}/{name}.mlpackage'
+            # CompiledMLModel handles .mlmodelc directly. MLModel only
+            # handles .mlpackage source format.
+            if prefer_compiled and os.path.exists(compiled):
+                return ct.models.CompiledMLModel(compiled,
+                    compute_units=ct.ComputeUnit.CPU_AND_NE)
+            if os.path.exists(source):
+                # Verify the source has weights (the .mlpackage Manifest
+                # exists but weight.bin can be missing if /tmp was cleaned).
+                weight_dir = f'{source}/Data/com.apple.CoreML/weights'
+                if os.path.isdir(weight_dir) and os.listdir(weight_dir):
+                    return ct.models.MLModel(source,
+                        compute_units=ct.ComputeUnit.CPU_AND_NE)
+            if os.path.exists(compiled):
+                return ct.models.CompiledMLModel(compiled,
+                    compute_units=ct.ComputeUnit.CPU_AND_NE)
+            raise FileNotFoundError(
+                f"neither compiled {compiled} nor source {source} (with weights) exists")
+
         for i in range(self.n_layers):
-            self.ct_models[f'L{i}_pre'] = ct.models.MLModel(
-                f'{self.build_dir}/L{i}_pre_q8.mlpackage',
-                compute_units=ct.ComputeUnit.CPU_AND_NE)
-            self.ct_models[f'L{i}_post'] = ct.models.MLModel(
-                f'{self.build_dir}/L{i}_post_q8.mlpackage',
-                compute_units=ct.ComputeUnit.CPU_AND_NE)
+            self.ct_models[f'L{i}_pre'] = _load_one(f'L{i}_pre_q8')
+            self.ct_models[f'L{i}_post'] = _load_one(f'L{i}_post_q8')
         self.n_lm = 0
-        while os.path.exists(f'{self.build_dir}/lm_head_{self.n_lm}_q8.mlpackage'):
-            self.ct_models[f'lm_head_{self.n_lm}'] = ct.models.MLModel(
-                f'{self.build_dir}/lm_head_{self.n_lm}_q8.mlpackage',
-                compute_units=ct.ComputeUnit.CPU_AND_NE)
+        while True:
+            name = f'lm_head_{self.n_lm}_q8'
+            compiled = f'{coreml_cache}/{name}.mlmodelc'
+            source = f'{self.build_dir}/{name}.mlpackage'
+            if not (os.path.exists(compiled) or os.path.exists(source)):
+                break
+            self.ct_models[f'lm_head_{self.n_lm}'] = _load_one(name)
             self.n_lm += 1
 
         self._loaded = True

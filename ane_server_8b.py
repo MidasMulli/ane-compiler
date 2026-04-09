@@ -30,6 +30,13 @@ _extractor = None
 _lock = threading.Lock()
 _tasks_completed = 0
 _start_time = 0
+# Main 35 close: expose the same in-flight fields as the 72B server so the
+# subconscious_daemon's health monitor can detect when the ANE is actively
+# generating and the visualization can light up the 8B "thinking" dot.
+_status = "idle"  # "idle" | "generating"
+_current_request_started_at = None
+_current_request_path = None
+_current_request_n_chars = 0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -42,19 +49,27 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "ok",
+            payload = {
+                # Daemon health monitor reads `status` to detect in-flight
+                # state. "ok" is the legacy idle marker; "generating" trips
+                # the upstream_thinking_started event in the daemon parser.
+                "status": _status if _status != "idle" else "ok",
                 "model": "Llama-3.1-8B-Instruct-Q8",
                 "backend": "ane-compiler-q8",
                 "uptime": round(uptime, 1),
                 "tasks_completed": _tasks_completed,
-            }).encode())
+                "current_request_started_at": _current_request_started_at,
+                "current_request_path": _current_request_path,
+                "current_request_n_chars": _current_request_n_chars,
+            }
+            self.wfile.write(json.dumps(payload).encode())
         else:
             self.send_response(404)
             self.end_headers()
 
     def do_POST(self):
-        global _tasks_completed
+        global _tasks_completed, _status, _current_request_started_at
+        global _current_request_path, _current_request_n_chars
         if self.path == "/v1/embed":
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
@@ -63,10 +78,20 @@ class Handler(BaseHTTPRequestHandler):
             pooling = data.get("pooling", "mean")
 
             with _lock:
+                _status = "generating"
+                _current_request_started_at = time.time()
+                _current_request_path = "/v1/embed"
+                _current_request_n_chars = len(text)
                 t0 = time.perf_counter()
-                vec, n_tokens = _extractor.embed_text(text, pooling=pooling)
-                elapsed_ms = (time.perf_counter() - t0) * 1000
-                _tasks_completed += 1
+                try:
+                    vec, n_tokens = _extractor.embed_text(text, pooling=pooling)
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    _tasks_completed += 1
+                finally:
+                    _status = "idle"
+                    _current_request_started_at = None
+                    _current_request_path = None
+                    _current_request_n_chars = 0
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -88,10 +113,20 @@ class Handler(BaseHTTPRequestHandler):
             max_tokens = data.get("max_tokens", 400)
 
             with _lock:
+                _status = "generating"
+                _current_request_started_at = time.time()
+                _current_request_path = "/analyze"
+                _current_request_n_chars = len(prompt)
                 t0 = time.perf_counter()
-                result = _extractor.generate(prompt, max_tokens=max_tokens)
-                elapsed_ms = (time.perf_counter() - t0) * 1000
-                _tasks_completed += 1
+                try:
+                    result = _extractor.generate(prompt, max_tokens=max_tokens)
+                    elapsed_ms = (time.perf_counter() - t0) * 1000
+                    _tasks_completed += 1
+                finally:
+                    _status = "idle"
+                    _current_request_started_at = None
+                    _current_request_path = None
+                    _current_request_n_chars = 0
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
