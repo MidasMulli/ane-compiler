@@ -60,7 +60,7 @@ def _load_c_lib():
         log.warning(f"failed to load libllama_cpu_ops.dylib: {e}")
         return None
 
-BUILD_DIR = '/tmp/llama_8b_q8'
+BUILD_DIR = '/Users/midas/Desktop/cowork/models/llama-8b-q8-ane'
 MODEL_PATH = os.path.expanduser(
     "~/.cache/huggingface/hub/models--unsloth--Meta-Llama-3.1-8B-Instruct/"
     "snapshots/a2856192dd7c25b842431f39c179a6c2c2f627d1/")
@@ -163,26 +163,35 @@ class ANEExtractor8B:
         import tempfile
         coreml_cache = tempfile.gettempdir()  # /var/folders/.../T/
 
-        def _load_one(name, prefer_compiled=True):
+        def _has_valid_source(p):
+            """A .mlpackage is usable if its weights/ subdir is non-empty."""
+            wd = f'{p}/Data/com.apple.CoreML/weights'
+            return os.path.isdir(wd) and bool(os.listdir(wd))
+
+        def _has_valid_compiled(p):
+            """A .mlmodelc is only loadable if coremldata.bin exists.
+            Some cached .mlmodelc dirs only have weights/ + analytics/
+            without the spec, which crashes CompiledMLModel."""
+            return os.path.isfile(f'{p}/coremldata.bin')
+
+        def _load_one(name, prefer_compiled=False):
+            # Default: prefer the source .mlpackage we just built. Fall
+            # back to the persistent compiled cache only if BOTH the
+            # source is missing/empty AND the compiled is fully valid.
             compiled = f'{coreml_cache}/{name}.mlmodelc'
             source = f'{self.build_dir}/{name}.mlpackage'
-            # CompiledMLModel handles .mlmodelc directly. MLModel only
-            # handles .mlpackage source format.
-            if prefer_compiled and os.path.exists(compiled):
+            if prefer_compiled and _has_valid_compiled(compiled):
                 return ct.models.CompiledMLModel(compiled,
                     compute_units=ct.ComputeUnit.CPU_AND_NE)
-            if os.path.exists(source):
-                # Verify the source has weights (the .mlpackage Manifest
-                # exists but weight.bin can be missing if /tmp was cleaned).
-                weight_dir = f'{source}/Data/com.apple.CoreML/weights'
-                if os.path.isdir(weight_dir) and os.listdir(weight_dir):
-                    return ct.models.MLModel(source,
-                        compute_units=ct.ComputeUnit.CPU_AND_NE)
-            if os.path.exists(compiled):
+            if os.path.exists(source) and _has_valid_source(source):
+                return ct.models.MLModel(source,
+                    compute_units=ct.ComputeUnit.CPU_AND_NE)
+            if _has_valid_compiled(compiled):
                 return ct.models.CompiledMLModel(compiled,
                     compute_units=ct.ComputeUnit.CPU_AND_NE)
             raise FileNotFoundError(
-                f"neither compiled {compiled} nor source {source} (with weights) exists")
+                f"neither compiled {compiled} (with coremldata.bin) "
+                f"nor source {source} (with weights) is valid")
 
         for i in range(self.n_layers):
             self.ct_models[f'L{i}_pre'] = _load_one(f'L{i}_pre_q8')

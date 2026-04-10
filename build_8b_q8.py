@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from llama_loader import LlamaModel, LlamaConfig
 from kv_cache import KVCache
 
-BUILD_DIR = '/tmp/llama_8b_q8'
+BUILD_DIR = '/Users/midas/Desktop/cowork/models/llama-8b-q8-ane'
 MODEL_PATH = os.path.expanduser(
     "~/.cache/huggingface/hub/models--unsloth--Meta-Llama-3.1-8B-Instruct/"
     "snapshots/a2856192dd7c25b842431f39c179a6c2c2f627d1/"
