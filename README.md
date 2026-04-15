@@ -14,9 +14,10 @@ Compile machine learning models for the Apple Neural Engine without going throug
 | **GPT-2 117M** | 25 (fused from 73 ops) | **229 tok/s** | ANE via `_ANEInMemoryModel` | Custom MIL activations (Mish, GELU-tanh, squared ReLU) |
 | **Llama 3.2-1B** | 25 (25d+C combined stack) | **50.2 tok/s** | ANE | Cross-layer fusion: post_attn + pre_attn = 40 → 25 dispatches |
 | **Llama 3.1-8B Q8** | 72 | **7.9 tok/s** | ANE | FP32 residual accumulation (FP16 fails past 16 layers at dim 4096), Llama 3 RoPE scaling |
+| **Llama 3.1-8B fused attention** | 32 (MIL IR) | **3.56 ms/block** | ANE (CPU_AND_NE) | Full attention incl. activation×activation matmul + softmax. SIP ON. 5/5 top-1 match vs PyTorch reference. Mechanism demo — does not beat production 72d throughput. |
 | **Neuron 80M** | 5 | **1,064 tok/s** | ANE SRAM | FFN-only domain classifier, 905 µs/dispatch, 98.7% accuracy |
 
-**Zero GPU contention** measured: 143 tok/s GPT-2 while GPU saturated vs 145 tok/s idle = −1.2% (noise floor).
+**Cross-accelerator contention is model-dependent** (see Hardware Characterization below). On GPT-2, 143 tok/s saturated vs 145 tok/s idle = −1.2% (noise floor). ANE-side contention stays inside the noise floor across verifier swaps; GPU-side contention scales with verifier decode cadence.
 
 ---
 
@@ -52,6 +53,19 @@ The `bench_combined_stack.py` measurement (42.2 → 50.2 tok/s on Llama-1B) and 
 - **DMA stride regime change at ic=768** — discrete binary threshold in the compiled `__text` section. Documented in vault notes; not yet measured for latency impact.
 - **128-program slot exclave wall** — the kext refuses to allocate more than 128 program objects per ANE client. Hardware-enforced.
 - **16-tile fixed channel partition** — work is sliced into 16 equal `(ic*oc*2)/16`-byte tile slabs at compile time. Hardware-validated; tile descriptors are cryptographically checked. Not user-tunable.
+
+---
+
+## Hardware Characterization
+
+Measurements from the ANE research program, registered in `data/measurement_registry.json`:
+
+- **Q8 = ANE deployment precision.** 97.4% of FP16 per-layer throughput at 50.4% memory cost. Q4 pays 31% latency penalty.
+- **FP32 internal accumulation.** ANE reduction network accumulates in FP32 with full mantissa (bit-exact on overflow probe). The FP32 between-dispatch requirement (§3.2 of Paper 1) is specific to the inter-dispatch residual stream, not ANE hardware.
+- **Cross-accelerator contention.** ANE DMA path is physically isolated from GPU. ANE-side contention: +0.38% (Gemma 4), +1.4% (Llama 70B). GPU-side: model-dependent (−4.7% Llama 70B, −20.1% Gemma 4 31B).
+- **Bidirectional SharedEvents.** Both GPU→ANE and ANE→GPU hardware event signaling confirmed working. See `ane-dispatch/examples/gpu_ane_sync.m`.
+- **GQA tile bottleneck.** 72% of on-ANE predicted cost is GQA head-repeat data materialization. Skip-tile fix (Q-group matmul) eliminates it with bitwise-identical output. −6% per-block ANE latency.
+- **53 ISA opcodes catalogued.** 8 emitted, 45 additional mapped with decoded control words. Full catalog in `vault/ane-reverse/`.
 
 ---
 
