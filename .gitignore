@@ -42,3 +42,6 @@ tests/ane_bench_dispatch
 tests/ane_cached_dispatch
 tests/ane_raw_dispatch
 tests/test_multi_input
+
+# Research scratch (out-of-tree experiments, not part of the compiler)
+.research_scratch/

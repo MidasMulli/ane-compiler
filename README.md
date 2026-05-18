@@ -14,7 +14,7 @@ Compile machine learning models for the Apple Neural Engine without going throug
 | **GPT-2 117M** | 25 (fused from 73 ops) | **229 tok/s** | ANE via `_ANEInMemoryModel` | Custom MIL activations (Mish, GELU-tanh, squared ReLU) |
 | **Llama 3.2-1B** | 25 (25d+C combined stack) | **50.2 tok/s** | ANE | Cross-layer fusion: post_attn + pre_attn = 40 → 25 dispatches |
 | **Llama 3.1-8B Q8** | 72 | **7.9 tok/s** | ANE | FP32 residual accumulation (FP16 fails past 16 layers at dim 4096), Llama 3 RoPE scaling |
-| **Llama 3.1-8B fused attention** | 32 (MIL IR) | **3.56 ms/block** | ANE (CPU_AND_NE) | Full attention incl. activation×activation matmul + softmax. SIP ON. 5/5 top-1 match vs PyTorch reference. Mechanism demo — does not beat production 72d throughput. |
+| **Llama 3.1-8B fused attention** | 32 (MIL IR) | **3.56 ms/block** | ANE (CPU_AND_NE) | Full attention incl. activation×activation matmul + softmax. SIP ON. 32/32 attention blocks compile; 5/5 prompts top-1 match vs PyTorch reference. Mechanism demo, does not beat production 72d throughput. |
 | **Neuron 80M** | 5 | **1,064 tok/s** | ANE SRAM | FFN-only domain classifier, 905 µs/dispatch, 98.7% accuracy |
 
 **Cross-accelerator contention is model-dependent** (see Hardware Characterization below). On GPT-2, 143 tok/s saturated vs 145 tok/s idle = −1.2% (noise floor). ANE-side contention stays inside the noise floor across verifier swaps; GPU-side contention scales with verifier decode cadence.
