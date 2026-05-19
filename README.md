@@ -52,7 +52,7 @@ The compiler emits per-layer dispatch artifacts that support residual capture an
 
 - **93 µs dispatch floor** on M5 Pro (XPC overhead). Below dim 1024, all latency is dispatch-bound, not compute-bound.
 - **dim≈2048 compute crossover**: above this, compute time equals dispatch time.
-- **DMA stride regime change at ic=768**: discrete binary threshold in the compiled `__text` section. Documented in vault notes; not yet measured for latency impact.
+- **DMA stride regime change at ic=768**: discrete binary threshold in the compiled `__text` section. Not yet measured for latency impact.
 - **128-program slot exclave wall**: the kext refuses to allocate more than 128 program objects per ANE client. Hardware-enforced.
 - **16-tile fixed channel partition**: work is sliced into 16 equal `(ic*oc*2)/16`-byte tile slabs at compile time. Hardware-validated; tile descriptors are cryptographically checked. Not user-tunable.
 
@@ -67,7 +67,7 @@ Measurements from the ANE research program, registered in `data/measurement_regi
 - **Cross-accelerator contention.** ANE DMA path is physically isolated from GPU. ANE-side contention: +0.38% (Gemma 4), +1.4% (Llama 70B). GPU-side: model-dependent (−4.7% Llama 70B, −20.1% Gemma 4 31B).
 - **Bidirectional SharedEvents.** Both GPU→ANE and ANE→GPU hardware event signaling confirmed working. See `ane-dispatch/examples/gpu_ane_sync.m`.
 - **GQA tile bottleneck.** 72% of on-ANE predicted cost is GQA head-repeat data materialization. Skip-tile fix (Q-group matmul) eliminates it with bitwise-identical output. −6% per-block ANE latency.
-- **53 ISA opcodes catalogued.** 8 emitted, 45 additional mapped with decoded control words. Full catalog in `vault/ane-reverse/`.
+- **53 ISA opcodes catalogued.** 8 emitted, 45 additional mapped with decoded control words.
 
 ---
 
