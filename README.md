@@ -83,6 +83,17 @@ Measurements from the ANE research program, registered in `data/measurement_regi
 
 ---
 
+## Related work
+
+This compiler emits ANE bytecode for macOS-side execution on H17 (M5 Pro). The Asahi Linux community has built complementary infrastructure for ANE execution on Linux without Apple toolchain dependencies:
+
+- [allbilly/ane](https://github.com/allbilly/ane): H13 ANE ops via pure Python register programming on Asahi Linux
+- [eiln/ane](https://github.com/eiln/ane): Linux kernel driver for the ANE
+- [tinygrad's accel/ane](https://github.com/tinygrad/tinygrad/tree/v0.10.3/extra/accel/ane/): original H13 reverse engineering
+- [Maynard Handley's vol7 ANE](https://github.com/name99-org/AArch64-Explore/blob/main/vol7%20ANE.nb.pdf): architectural analysis
+
+---
+
 ## Related repos
 
 - [orion-ane](https://github.com/MidasMulli/orion-ane): Midas cognitive agent + Subconscious memory system that uses these models
