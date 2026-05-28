@@ -55,7 +55,7 @@ _libc = ctypes.CDLL(ctypes.util.find_library("c"))
 _mach_task_self = ctypes.c_uint32.in_dll(_libc, "mach_task_self_")
 
 # Constants
-ANED_CACHE = "/Library/Caches/com.apple.aned/25E246/ModelAssetsCache"
+ANED_CACHE = "/Library/Caches/com.apple.aned/25E253/ModelAssetsCache"
 ARGS_SIZE = 3464
 OUTPUT_SIZE = 706360
 kIOMainPortDefault = 0
