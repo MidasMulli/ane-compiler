@@ -1,9 +1,9 @@
 # ane-compiler
 
-Compile machine learning models for the Apple Neural Engine without going through Apple's CoreML / aned compiler service. Two modes:
+Compile machine learning models for the Apple Neural Engine, driving the ANE through custom MIL IR rather than a hand-written CoreML model. Two modes:
 
-- **SIP ON**: fused-subgraph execution via `_ANEInMemoryModel` + MIL IR. 37 fused subgraphs from a 73-op GPT-2. Guaranteed ANE execution, validated by `doEvaluateDirectWithModel`.
-- **SIP OFF**: direct `.hwx` emission. Byte-identical to aned output. LLDB in-flight swap intercepts `sel=3 ProgramCreate` and overwrites the mmap'd `.hwx` before the kext reads it. Demo runs as a single command.
+- **SIP ON**: fused-subgraph execution via `_ANEInMemoryModel` + MIL IR. 37 fused subgraphs from a 73-op GPT-2. Guaranteed ANE execution, validated by `doEvaluateDirectWithModel`. (This path still uses Apple's `aned` compiler under the hood: custom MIL is submitted and `aned` emits the multi-pass binary. The contribution is the MIL the compiler generates and the per-layer dispatch control around it, not an aned bypass.)
+- **SIP OFF**: direct `.hwx` manipulation. The emitted `.hwx` is byte-identical to aned output. An LLDB in-flight swap intercepts `ProgramCreate` and overwrites the mmap'd `.hwx` before the kext reads it, giving opcode/dequant/DMA-schedule control over what executes. Note: a fully user-side IOKit dispatch that bypasses `aned` is not available on macOS 26 (the kext path is gated); this mode operates on the aned-mediated artifact, not against it.
 
 ---
 
@@ -13,11 +13,11 @@ Compile machine learning models for the Apple Neural Engine without going throug
 |---|---|---|---|---|
 | **GPT-2 117M** | 25 (fused from 73 ops) | **229 tok/s** | ANE via `_ANEInMemoryModel` | Custom MIL activations (Mish, GELU-tanh, squared ReLU) |
 | **Llama 3.2-1B** | 25 (25d+C combined stack) | **50.2 tok/s** | ANE | Cross-layer fusion: post_attn + pre_attn = 40 → 25 dispatches |
-| **Llama 3.1-8B Q8** | 72 | **7.9 tok/s** | ANE | FP32 residual accumulation (FP16 fails past 16 layers at dim 4096), Llama 3 RoPE scaling |
-| **Llama 3.1-8B fused attention** | 32 (MIL IR) | **3.56 ms/block** | ANE (CPU_AND_NE) | Full attention incl. activation×activation matmul + softmax. SIP ON. 32/32 attention blocks compile; 5/5 prompts top-1 match vs PyTorch reference. Mechanism demo, does not beat production 72d throughput. |
+| **Llama 3.1-8B Q8** | 72 | **9.66 tok/s** | ANE | Placement-verified (IOReport, n_a_reads=0), reproduced 9.53/9.66 on the 72-dispatch residual-capture *instrument* build. FP32 residual accumulation (FP16 fails past 16 layers at dim 4096), Llama 3 RoPE scaling. (The earlier 7.9 figure is retired: it was silent-offload-confounded; see registry `llama-8b.throughput_ane`.) |
+| **Llama 3.1-8B fused attention** | 40 (MIL IR) | correctness only | ANE (CPU_AND_NE) | Full attention incl. activation×activation matmul + softmax. SIP ON. Fused-block dispatch count 40 and 5/5 prompt top-1 match vs PyTorch reference are the canonical claims here. The full-block fused *throughput* figure (13.4 tok/s) is a **separate candidate fused-multipass build** (registry `llama_3_1_8b_ane.fused_multipass_tok_s`, candidate), NOT this row and NOT the 9.66 headline; it is not yet promoted to canonical. Mechanism/correctness demo, not a throughput claim. |
 | **Neuron 80M** | 5 | **1,064 tok/s** | ANE SRAM | FFN-only domain classifier, 905 µs/dispatch, 98.7% accuracy |
 
-**Cross-accelerator contention is model-dependent** (see Hardware Characterization below). On GPT-2, 143 tok/s saturated vs 145 tok/s idle = −1.2% (noise floor). ANE-side contention stays inside the noise floor across verifier swaps; GPU-side contention scales with verifier decode cadence.
+**Cross-accelerator contention is model-dependent, not zero** (see Hardware Characterization below). The honest split: ANE-side cost is small and model-invariant (+1.4% Llama 70B, +0.38% Gemma 4 31B), while GPU-side cost is verifier-scale-dependent (−4.7% Llama 70B, −20.1% Gemma 4 31B). Separately, a *concurrent ANE monitor* costs ~2.2% GPU throughput per GB of weight-streaming footprint it places (small monitor ~2–4%, a full-8B placed monitor ~16%; M105 footprint sweep, VERIFIED). This is not "zero contention."
 
 ---
 
@@ -25,11 +25,11 @@ Compile machine learning models for the Apple Neural Engine without going throug
 
 `libllama_cpu_ops.dylib` ships fused C/Accelerate kernels for the parts of an LLM forward pass that don't run on the ANE:
 
-- `llama_gqa_attention`: fused QK^T → softmax → V via vDSP/BLAS. **78× faster** than the equivalent Python NumPy loop on a 64×64 fp16 conv.
+- `llama_gqa_attention`: fused QK^T → softmax → V via vDSP/BLAS, replacing a Python NumPy loop.
 - `llama_rope`: plain RoPE (no scaling) via vDSP. Use a wrapper that supplies precomputed cos/sin tables for Llama-3-style scaling.
 - `llama_rms_norm`: fused RMSNorm via `vDSP_meanvv` + `vvrsqrtf`.
 
-End-to-end measurement on the production 8B prompt-encode path: **6.23 → 9.9 tok/s (+59%)** after wiring `llama_gqa_attention` into `ane_extractor_8b.py:_gqa_attention`.
+These kernels move the non-ANE parts of the forward pass off the Python path. *(The per-kernel speedup multiple and the end-to-end prompt-encode tok/s delta from an earlier build are not yet registered in the canonical measurement registry and so are not quoted here as verified numbers.)*
 
 ---
 
@@ -41,6 +41,8 @@ The compiler walks a fused-graph IR and emits one of two outputs:
 2. Raw `.hwx` Mach-O kernel images, byte-identical to what aned produces, ready for direct kext load via the IOKit `H11ANEIn` user client (`sel=3 ProgramCreate`).
 
 The MIL IR path is the practical one: it works under SIP ON, doesn't need kext loads, and handles 14 elementwise op primitives plus all the standard transformer ops (linear, layer_norm, gelu, softmax, matmul, gather). The `.hwx` direct path exists as proof that the compiler matches Apple's binary format.
+
+**Scope note (what is and isn't unique here).** Multi-pass `__text`/`__KERN_0` emission for a complex MIL program is *not* unique to this project: Apple's own `aned`, driven through the public `coremltools` path, emits the same multi-pass binary. The throughput numbers above are reproductions of what the production CoreML/aned stack already achieves on this hardware, presented as a characterization baseline, not as a faster-than-Apple compiler. The two capabilities this repo adds on top of that stack are (1) **per-layer residual capture and inject** at arbitrary layer boundaries (the instrument that underpins the cross-instance coupling research below), and (2) **opcode-level dispatch plus dequant/DMA-scheduling control** via the SIP-off path. Those are the load-bearing contributions; the tok/s figures are context, not the claim.
 
 The `bench_combined_stack.py` measurement (42.2 → 50.2 tok/s on Llama-1B) and the `bench_cross_layer_fusion.py` measurement (40 → 25 dispatches via post-attn + pre-attn fusion) are the experimental evidence that fusion *depth*, not channel-count tuning, is the optimization lever for small models on this hardware.
 
@@ -62,9 +64,9 @@ The compiler emits per-layer dispatch artifacts that support residual capture an
 
 Measurements from the ANE research program, registered in `data/measurement_registry.json`:
 
-- **Q8 = ANE deployment precision.** 97.4% of FP16 per-layer throughput at 50.4% memory cost. Q4 pays 31% latency penalty.
+- **Q8 = ANE deployment precision.** Q8 finishes a layer in ~97.4% of FP16 wall time at 50.4% memory cost. This is *same wall-time, not free dequant*: Q8 moves half the bytes but feeds them through the on-ANE int→fp16 dequant pipeline at roughly half the effective bandwidth (~80 GB/s vs ~155 GB/s FP16), so the two land at parity. Q4 pays a 31% latency penalty.
 - **FP32 internal accumulation.** ANE reduction network accumulates in FP32 with full mantissa (bit-exact on overflow probe). The FP32 between-dispatch requirement (§3.2 of Paper 1) is specific to the inter-dispatch residual stream, not ANE hardware.
-- **Cross-accelerator contention.** ANE DMA path is physically isolated from GPU. ANE-side contention: +0.38% (Gemma 4), +1.4% (Llama 70B). GPU-side: model-dependent (−4.7% Llama 70B, −20.1% Gemma 4 31B).
+- **Cross-accelerator contention.** Not zero. ANE-side cost is small and model-invariant: +0.38% (Gemma 4 31B), +1.4% (Llama 70B). GPU-side cost is verifier-scale-dependent: −4.7% (Llama 70B), −20.1% (Gemma 4 31B) (registry `contention.ane`, `contention.gpu`, `gemma4_31b.contention_*`). Separately, a concurrent ANE *monitor* costs ~2.2% GPU throughput per GB of weight-streaming footprint it places: a small placed monitor ~2–4%, a full-8B placed monitor ~16% (M105 footprint sweep, VERIFIED). The DMA path isolation bounds the *idle* case; an actively-streaming concurrent ANE workload does take measurable GPU throughput.
 - **Bidirectional SharedEvents.** Both GPU→ANE and ANE→GPU hardware event signaling confirmed working. See `ane-dispatch/examples/gpu_ane_sync.m`.
 - **GQA tile bottleneck.** 72% of on-ANE predicted cost is GQA head-repeat data materialization. Skip-tile fix (Q-group matmul) eliminates it with bitwise-identical output. −6% per-block ANE latency.
 - **53 ISA opcodes catalogued.** 8 emitted, 45 additional mapped with decoded control words.
@@ -73,13 +75,20 @@ Measurements from the ANE research program, registered in `data/measurement_regi
 
 ## Living Model
 
-`living_model_*.py` is the parked LoRA-during-inference experiment. Three runs measured no overall adaptation headroom (+0%) but the 76% prediction window at tokens 150–175 (vs 55% frozen baseline) showed real signal in early noise; flagged but parked. The Main 26 weight intervention revival (see commit history) opens a different question worth re-examining: now that mid-dispatch DRAM weight modification works through the fresh-`compileWithQoS:` path at ~10 ms/probe, layer-wise ablation studies become tractable.
+`living_model_*.py` tracks whether a model's weights can be edited in place between dispatches. Current state (two distinct results, kept separate):
+
+- **FP16 weight patch-execute: VERIFIED (S3 Leg-2, independently reproduced).** A reversible edit to the weights inside the live multi-pass FP16 block (the 838 MB / 7-pass compiled blob) reaches the executing substrate: it changes the ANE block output and then reverts byte-identical, confirmed by an independent reproduction (Rule 2.1 satisfied). The patched program reloads via the CoreML cache read (~6 ms re-mmap, not a full recompile). Registry `gainsteer.primitive` (VERIFIED real-FP16), `ane.hwx_patch_execute_bound` (the earlier "small single-pass only" bound is REFUTED for FP16 multipass).
+- **Per-channel gain-write: VERIFIED primitive, but a MAGNITUDE knob, not a behavioral STEERING knob.** A per-channel gain delta applies exactly on real FP16 Llama-3.1-8B L31 weights (places + executes + reversibly moves the argmax token; cos ≈ 0.9999997 on the gain subset). But the gain-induced basin-shift does **not** exceed a norm-matched uniform null (null ≥ gain at every differing level, both runs; M105 four-kill close, registry `gainsteer.behavioral` = MAGNITUDE-ONLY-FAIL). So this is a controllable magnitude lever on the live weights, **not** a means of steering the model toward a chosen behavior. Do not read it as behavioral control.
+- **Arbitrary low-rank weight delta (continuous-LoRA-style B@A): REFUTED.** A general rank-2 update does not reproduce on the substrate (repro cos ≈ 0.118); the int8 tile-interleave permutation needed for an arbitrary delta is not decoded. Only the gain-shaped (magnitude) subset is reachable.
+- **int4 / Q4 same-topology: not on the ANE.** The quantized path is CPU-routed on macOS 26.3, so patch-control is moot there.
+
+The mid-dispatch DRAM-overwrite framing from earlier runs was a methodology artifact (it patched an FP16-stage decoy cache entry that int4 execution never reads); the corrected result above supersedes it. Net: the weight-write reaches the live FP16 substrate (a verified instrument primitive); it is a magnitude substrate, not a steering one.
 
 ---
 
 ## Project Chimera
 
-`project_chimera_*.py` measured ANE↔GPU handoff cost as **0 µs** (zero, not "small"). Conclusion: handoff is not the bottleneck; GPU Q4 dominates compute at the relevant model sizes. The lesson is that single-accelerator throughput dominates handoff overhead at every interesting model scale. Parked, with the measurement preserved as the reason future split-compute proposals start out skeptical.
+`project_chimera_*.py` measured ANE↔GPU handoff cost at or below the noise floor (~0.1 ms/dispatch via zero-copy IOSurface-backed activation transfer; not literally zero, but negligible against per-layer compute). Conclusion: handoff is not the bottleneck; single-accelerator compute dominates handoff overhead at every interesting model scale. Parked, with the measurement preserved as the reason future split-compute proposals start out skeptical.
 
 ---
 

@@ -45,3 +45,10 @@ tests/test_multi_input
 
 # Research scratch (out-of-tree experiments, not part of the compiler)
 .research_scratch/
+
+# Research-script imports needed by external bridge_training scripts
+# (kept on sys.path; not part of public compiler scope)
+_track2_d1_d2.py
+_apd_L1_methodology_search.py
+_phase1_ane_same_sub_smoke.py
+_v1_5_interface_projection.py
