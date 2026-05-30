@@ -105,7 +105,7 @@ This compiler emits ANE bytecode for macOS-side execution on H17 (M5 Pro). The A
 
 ## Related repos
 
-- [orion-ane](https://github.com/MidasMulli/orion-ane): Midas cognitive agent + Subconscious memory system that uses these models
+- [orion-ane](https://github.com/MidasMulli/cognitive-stack-ane): Midas cognitive agent + Subconscious memory system that uses these models
 - [subconscious](https://github.com/MidasMulli/subconscious): the cognitive memory loops as a separate package
 - [ane-dispatch](https://github.com/MidasMulli/ane-dispatch): direct ANE dispatch + SharedEvents (37% faster than CoreML)
 - [ane-toolkit](https://github.com/MidasMulli/ane-toolkit): IOKit protocol decoder + Mach-O `.hwx` tooling
