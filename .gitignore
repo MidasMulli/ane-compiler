@@ -52,3 +52,19 @@ _track2_d1_d2.py
 _apd_L1_methodology_search.py
 _phase1_ane_same_sub_smoke.py
 _v1_5_interface_projection.py
+
+# Scrub 2026-07-16: untracked local-only items (research/scratch, live-infra binary,
+# nested-repo symlink) — never publish; prevents accidental `git add .` leak
+ane-dispatch
+cognitive_bus_disambig
+cognitive_bus_disambig.pre_m1_bak
+fused_inject_smoke/
+perop_divergence/
+
+# graphify-out/ -- code-graph build cache (~94 MB). Also indexes sources, so it
+# can carry gated content past a source-level gate. Never commit.
+graphify-out/
+
+# compiled probe/test binaries (sources are the .m beside them)
+tests/ane_eval_multi
+tests/ane_map_probe
